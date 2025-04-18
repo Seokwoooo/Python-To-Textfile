@@ -1,0 +1,292 @@
+import torch
+import torch.nn as nn
+from transformers import AutoTokenizer, AutoModel
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+import os
+from tqdm import tqdm
+import argparse
+import pandas as pd # Added pandas import
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
+
+# Assuming these functions exist and work correctly
+from data_preprocessing import load_data, prepare_data
+from model import SoomgoServiceClassifier, get_device
+
+# Copied and adapted evaluate function from train.py
+def evaluate(model, data_loader, criterion, device):
+    """
+    모델 평가 함수
+    """
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    all_service_types = []
+    all_service_type_preds = []
+
+    with torch.no_grad():
+        for batch in tqdm(data_loader, desc="Evaluating"):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label'].to(device)
+            service_types = batch['service_type'].to(device)
+
+            logits, probabilities, service_type_logits = model(input_ids, attention_mask)
+
+            if criterion:
+                loss = criterion(logits, labels) + 0.5 * criterion(service_type_logits, service_types)
+                total_loss += loss.item()
+            else:
+                 loss = None
+
+            preds = torch.argmax(probabilities, dim=1).cpu().numpy()
+            service_type_preds = torch.argmax(service_type_logits, dim=1).cpu().numpy()
+
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
+            all_service_types.extend(service_types.cpu().numpy())
+            all_service_type_preds.extend(service_type_preds)
+
+    accuracy = accuracy_score(all_labels, all_preds)
+    # Use average='binary' for suitability F1 as in training
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average='binary', zero_division=0
+    )
+
+    service_type_accuracy = accuracy_score(all_service_types, all_service_type_preds)
+
+    eval_results = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1, # Suitability F1 Score
+        'service_type_accuracy': service_type_accuracy
+    }
+    if criterion:
+        eval_results['loss'] = total_loss / len(data_loader) if len(data_loader) > 0 else 0
+    else:
+        eval_results['loss'] = None
+
+    return eval_results
+
+def plot_confusion_matrix(labels, predictions, output_dir, model_name):
+    """
+    혼동 행렬을 시각화하는 함수
+    
+    Args:
+        labels (array): 실제 레이블
+        predictions (array): 예측 레이블
+        output_dir (str): 그래프를 저장할 디렉토리
+        model_name (str): 모델 이름
+    """
+    cm = confusion_matrix(labels, predictions)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['적합', '부적합'], 
+                yticklabels=['적합', '부적합'])
+    plt.title('Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'{model_name}_confusion_matrix.png'))
+    plt.close()
+
+def plot_performance_metrics(metrics, output_dir, model_name):
+    """
+    모델의 성능 지표를 시각화하는 함수
+    
+    Args:
+        metrics (dict): 모델 성능 지표
+        output_dir (str): 그래프를 저장할 디렉토리
+        model_name (str): 모델 이름
+    """
+    metric_names = ['Accuracy', 'Precision', 'Recall', 'F1', 'Service Type Accuracy']
+    metric_values = [
+        metrics['accuracy'],
+        metrics['precision'],
+        metrics['recall'],
+        metrics['f1'],
+        metrics['service_type_accuracy']
+    ]
+    
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(metric_names, metric_values, color=['#3498db', '#2ecc71', '#f39c12', '#e74c3c', '#9b59b6'])
+    
+    # 바 위에 값 표시
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                 f'{height:.4f}', ha='center', va='bottom', fontweight='bold')
+    
+    plt.title(f'Performance Metrics: {model_name}')
+    plt.ylim(0, 1.1)  # 값이 0~1 범위이므로
+    plt.ylabel('Score')
+    plt.grid(True, linestyle='--', alpha=0.7, axis='y')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'{model_name}_performance_metrics.png'))
+    plt.close()
+
+def main(device_choice='cpu', output_folder='unified_output', model_file=None):
+    """
+    기존 모델 평가 메인 함수
+    
+    Args:
+        device_choice (str): 평가에 사용할 디바이스 ('cpu' 또는 'gpu')
+        output_folder (str): 모델과 토크나이저가 저장된 폴더 경로
+        model_file (str): 평가할 모델 파일명 (없으면 이름에 F1 점수가 있는 최신 모델 사용)
+    """
+    # 설정
+    batch_size = 16
+    random_state = 42
+    output_dir = output_folder
+    
+    # 모델 파일 지정되지 않았으면 가장 높은 F1 점수의 모델 선택
+    if model_file is None:
+        model_files = [f for f in os.listdir(output_dir) if f.startswith('model_f1_') and f.endswith('.pt')]
+        if not model_files:
+            print(f"오류: '{output_dir}' 디렉토리에 'model_f1_*.pt' 형식의 모델 파일이 없습니다.")
+            return
+        
+        # F1 점수 기준으로 정렬 (내림차순)
+        model_files.sort(key=lambda x: float(x.split('_')[2].split('.pt')[0]), reverse=True)
+        model_file = model_files[0]
+        print(f"가장 높은 F1 점수의 모델을 자동 선택: {model_file}")
+    
+    model_path = os.path.join(output_dir, model_file)
+    tokenizer_path = os.path.join(output_dir, 'tokenizer')
+    data_path = "AI_RPA/DataSet/soomgo data.json"
+    
+    # 모델 이름에서 F1 점수 추출 (시각화용)
+    model_name = os.path.splitext(model_file)[0]  # .pt 확장자 제거
+    
+    # 디바이스 설정
+    if device_choice.lower() == 'gpu' and torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+    print(f"사용 디바이스: {device}")
+
+    # 모델 및 토크나이저 경로 확인
+    if not os.path.exists(model_path):
+        print(f"오류: 모델 파일({model_path})을 찾을 수 없습니다.")
+        return
+    if not os.path.isdir(tokenizer_path):
+        print(f"오류: 토크나이저 디렉토리({tokenizer_path})를 찾을 수 없습니다.")
+        return
+
+    print(f"'{tokenizer_path}'에서 토크나이저 로드 중...")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    except Exception as e:
+        print(f"오류: 토크나이저 로드 실패 - {e}")
+        return
+
+    # 데이터 로드 및 준비
+    print(f"데이터 로드 중: {data_path}")
+    try:
+        df = load_data(data_path)
+        if df is None or df.empty:
+            print("데이터 로드 실패 또는 데이터가 비어있습니다.")
+            return
+        print(f"총 데이터 수: {len(df)}")
+        print(f"적합한 요청 수: {len(df[df['label'] == 0])}")
+        print(f"부적합한 요청 수: {len(df[df['label'] == 1])}")
+
+    except FileNotFoundError:
+        print(f"오류: 데이터 파일({data_path})을 찾을 수 없습니다.")
+        return
+    except Exception as e:
+        print(f"오류: 데이터 로드 중 예외 발생 - {e}")
+        return
+
+    # 데이터셋 분할 (테스트 로더만 필요)
+    print("테스트 데이터 로더 준비 중...")
+    try:
+        _, _, test_loader = prepare_data(
+            df, tokenizer, test_size=0.2, val_size=0.1, random_state=random_state
+        )
+        if not test_loader:
+             print("오류: 테스트 데이터 로더 생성 실패.")
+             return
+        print(f"테스트 데이터 로더 준비 완료 (배치 크기: {batch_size})")
+    except Exception as e:
+        print(f"오류: 데이터 준비 중 예외 발생 - {e}")
+        return
+
+    # 모델 초기화 및 가중치 로드
+    print("모델 초기화 중...")
+    try:
+        model = SoomgoServiceClassifier()
+    except Exception as e:
+        print(f"오류: 모델 아키텍처 초기화 실패 - {e}")
+        return
+
+    print(f"저장된 모델 가중치 로드 중: {model_path}")
+    try:
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model = model.to(device)
+        print("모델 가중치 로드 성공.")
+    except Exception as e:
+        print(f"오류: 모델 가중치 로드 실패 - {e}")
+        return
+
+    # 손실 함수 정의
+    criterion = nn.CrossEntropyLoss()
+
+    # 테스트 세트 평가
+    print("\n테스트 세트 평가 시작...")
+    try:
+        test_metrics = evaluate(model, test_loader, criterion, device)
+    except Exception as e:
+        print(f"오류: 평가 중 예외 발생 - {e}")
+        return
+
+    # 결과 출력
+    print("\n=== 테스트 결과 ===")
+    if test_metrics.get('loss') is not None:
+      print(f"Test Loss: {test_metrics['loss']:.4f}")
+    print(f"Test Accuracy: {test_metrics.get('accuracy', 'N/A'):.4f}")
+    print(f"Test Precision: {test_metrics.get('precision', 'N/A'):.4f}")
+    print(f"Test Recall: {test_metrics.get('recall', 'N/A'):.4f}")
+    print(f"Test F1 Score: {test_metrics.get('f1', 'N/A'):.4f}")
+    print(f"Test Service Type Accuracy: {test_metrics.get('service_type_accuracy', 'N/A'):.4f}")
+    print("===================")
+    
+    # 추가 시각화 생성
+    print("\n모델 성능 시각화 생성 중...")
+    
+    # 혼동 행렬 시각화
+    with torch.no_grad():
+        all_preds = []
+        all_labels = []
+        for batch in test_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label']
+            
+            logits, probabilities, _ = model(input_ids, attention_mask)
+            preds = torch.argmax(probabilities, dim=1).cpu().numpy()
+            
+            all_preds.extend(preds)
+            all_labels.extend(labels.numpy())
+    
+    plot_confusion_matrix(all_labels, all_preds, output_dir, model_name)
+    
+    # 성능 지표 시각화
+    plot_performance_metrics(test_metrics, output_dir, model_name)
+    
+    print(f"시각화 파일이 {output_dir} 디렉토리에 저장되었습니다.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Evaluate a trained Soomgo Service Classifier model.")
+    parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'gpu'],
+                        help='Device to use for evaluation (cpu or gpu)')
+    parser.add_argument('--output_folder', type=str, default='unified_output',
+                        help='Path to the folder containing model files and tokenizer directory')
+    parser.add_argument('--model_file', type=str, default=None,
+                        help='Name of the model file to evaluate (if not specified, uses the one with highest F1 score)')
+    args = parser.parse_args()
+    main(device_choice=args.device, output_folder=args.output_folder, model_file=args.model_file) 

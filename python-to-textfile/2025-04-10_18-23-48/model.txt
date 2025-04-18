@@ -1,0 +1,489 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import os
+import json
+from transformers import AutoModel, AutoTokenizer, AutoConfig
+
+class MultiHeadAttention(nn.Module):
+    """
+    멀티헤드 어텐션 모듈
+    여러 개의 어텐션 헤드를 사용하여 다양한 특징 공간에서 정보를 추출합니다.
+    """
+    def __init__(self, hidden_size, num_heads=8):
+        """
+        멀티헤드 어텐션 초기화
+        
+        Args:
+            hidden_size (int): 은닉층 크기
+            num_heads (int): 어텐션 헤드 수
+        """
+        super(MultiHeadAttention, self).__init__()
+        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+        
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        
+        # Q, K, V 선형 투영
+        self.query = nn.Linear(hidden_size, hidden_size)
+        self.key = nn.Linear(hidden_size, hidden_size)
+        self.value = nn.Linear(hidden_size, hidden_size)
+        
+        # 출력 투영
+        self.output_projection = nn.Linear(hidden_size, hidden_size)
+        
+        self.dropout = nn.Dropout(0.1)
+        
+    def forward(self, x):
+        """
+        멀티헤드 어텐션 순전파
+        
+        Args:
+            x (torch.Tensor): 입력 텐서 (batch_size, seq_len, hidden_size)
+            
+        Returns:
+            torch.Tensor: 어텐션 적용된 텐서
+        """
+        batch_size = x.size(0)
+        
+        # QKV 투영
+        q = self.query(x).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.key(x).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.value(x).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # 스케일드 닷-프로덕트 어텐션
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(torch.tensor(self.head_dim, dtype=torch.float))
+        attn_probs = self.dropout(nn.functional.softmax(attn_scores, dim=-1))
+        
+        # 가중치 적용 및 헤드 결합
+        context = torch.matmul(attn_probs, v)
+        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.hidden_size)
+        
+        # 출력 투영
+        output = self.output_projection(context)
+        
+        return output
+
+class CrossModalAttention(nn.Module):
+    """
+    크로스 모달 어텐션 모듈
+    두 개의 서로 다른 모달리티(요청서와 채팅) 간의 상호작용을 학습합니다.
+    """
+    def __init__(self, hidden_size):
+        """
+        크로스 모달 어텐션 초기화
+        
+        Args:
+            hidden_size (int): 은닉층 크기
+        """
+        super(CrossModalAttention, self).__init__()
+        self.hidden_size = hidden_size
+        
+        # 크로스 어텐션을 위한 선형 변환
+        self.query_transform = nn.Linear(hidden_size, hidden_size)
+        self.key_transform = nn.Linear(hidden_size, hidden_size)
+        self.value_transform = nn.Linear(hidden_size, hidden_size)
+        
+        # 출력 투영
+        self.output_projection = nn.Linear(hidden_size, hidden_size)
+        
+        self.dropout = nn.Dropout(0.1)
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        
+    def forward(self, x1, x2):
+        """
+        크로스 모달 어텐션 순전파
+        
+        Args:
+            x1 (torch.Tensor): 첫 번째 모달 텐서 (batch_size, seq_len1, hidden_size)
+            x2 (torch.Tensor): 두 번째 모달 텐서 (batch_size, seq_len2, hidden_size)
+            
+        Returns:
+            torch.Tensor: 어텐션 적용된 텐서
+        """
+        # 첫 번째 모달을 쿼리로 사용하여 두 번째 모달에 어텐션 적용
+        query = self.query_transform(x1)  # (batch_size, seq_len1, hidden_size)
+        key = self.key_transform(x2)      # (batch_size, seq_len2, hidden_size)
+        value = self.value_transform(x2)  # (batch_size, seq_len2, hidden_size)
+        
+        # 어텐션 스코어 계산
+        attention_scores = torch.matmul(query, key.transpose(-2, -1)) / torch.sqrt(torch.tensor(self.hidden_size, dtype=torch.float))
+        attention_probs = self.dropout(nn.functional.softmax(attention_scores, dim=-1))
+        
+        # 가중치 적용
+        context = torch.matmul(attention_probs, value)
+        
+        # 출력 투영 및 잔차 연결
+        output = self.output_projection(context)
+        output = self.layer_norm(x1 + output)
+        
+        return output
+
+class SoomgoServiceClassifier(nn.Module):
+    """
+    숨고 서비스 오선택 탐지 모델
+    BERT 기반의 이진 분류 모델로, 요청 텍스트가 '이사/입주청소업체' 서비스에 적합한지 판단합니다.
+    멀티헤드 어텐션 및 크로스 어텐션 메커니즘을 사용하여 텍스트의 중요한 부분에 집중합니다.
+    요청서와 채팅 텍스트를 별도로 처리하여 각각의 특성을 반영합니다.
+    """
+    def __init__(self, model_name='klue/bert-base', num_heads=8):
+        """
+        모델 초기화
+        
+        Args:
+            model_name (str): 사용할 BERT 모델 이름
+            num_heads (int): 멀티헤드 어텐션의 헤드 수
+        """
+        super(SoomgoServiceClassifier, self).__init__()
+        
+        # BERT 모델 로드 (요청서와 채팅 공유)
+        if os.path.exists("./unified_output/bert_model"):
+            self.bert = torch.load("./unified_output/bert_model", weights_only=False)
+        else:
+            from transformers import BertConfig, BertModel
+            config = BertConfig.from_pretrained(model_name)
+            self.bert = BertModel(config)
+            os.makedirs("./unified_output", exist_ok=True)
+            torch.save(self.bert, "./unified_output/bert_model")
+        
+        hidden_size = self.bert.config.hidden_size
+        
+        # 멀티헤드 셀프 어텐션 - 각 모달별로 별도 처리
+        self.request_self_attention = MultiHeadAttention(hidden_size, num_heads)
+        self.chat_self_attention = MultiHeadAttention(hidden_size, num_heads)
+        
+        # 크로스 모달 어텐션 - 요청서→채팅, 채팅→요청서 양방향
+        self.request_to_chat_attention = CrossModalAttention(hidden_size)
+        self.chat_to_request_attention = CrossModalAttention(hidden_size)
+        
+        # 특징 결합을 위한 선형 변환
+        self.request_projection = nn.Linear(hidden_size, hidden_size)
+        self.chat_projection = nn.Linear(hidden_size, hidden_size)
+        self.combined_projection = nn.Linear(hidden_size * 2, hidden_size)
+        
+        # 서비스 유형 분류 헤드
+        self.service_type_classifier = nn.Linear(hidden_size, 4)  # 입주청소, 이사청소, 거주청소, 기타
+        
+        # 적합도 분류 헤드
+        self.dropout = nn.Dropout(0.2)  # 드롭아웃 비율 증가
+        self.classifier = nn.Linear(hidden_size * 3, 2)  # 요청서, 채팅, 결합 특징 사용
+        
+        # 레이어 정규화
+        self.layer_norm1 = nn.LayerNorm(hidden_size)
+        self.layer_norm2 = nn.LayerNorm(hidden_size)
+        self.layer_norm3 = nn.LayerNorm(hidden_size * 2)
+        
+    def forward(self, request_input_ids, request_attention_mask, chat_input_ids, chat_attention_mask):
+        """
+        모델의 순전파 로직
+        
+        Args:
+            request_input_ids (torch.Tensor): 요청서 입력 텍스트의 토큰 ID
+            request_attention_mask (torch.Tensor): 요청서 어텐션 마스크
+            chat_input_ids (torch.Tensor): 채팅 입력 텍스트의 토큰 ID
+            chat_attention_mask (torch.Tensor): 채팅 어텐션 마스크
+            
+        Returns:
+            tuple: (로짓, 확률값, 서비스 유형 로짓)
+        """
+        # 요청서 인코딩
+        request_outputs = self.bert(
+            input_ids=request_input_ids,
+            attention_mask=request_attention_mask
+        )
+        
+        # 채팅 인코딩
+        chat_outputs = self.bert(
+            input_ids=chat_input_ids,
+            attention_mask=chat_attention_mask
+        )
+        
+        # 마지막 은닉 상태
+        request_hidden = request_outputs.last_hidden_state  # (batch_size, seq_len, hidden_size)
+        chat_hidden = chat_outputs.last_hidden_state        # (batch_size, seq_len, hidden_size)
+        
+        # 멀티헤드 셀프 어텐션 적용 (잔차 연결)
+        request_attended = self.request_self_attention(request_hidden)
+        request_attended = self.layer_norm1(request_hidden + request_attended)
+        
+        chat_attended = self.chat_self_attention(chat_hidden)
+        chat_attended = self.layer_norm2(chat_hidden + chat_attended)
+        
+        # [CLS] 토큰의 임베딩 추출
+        request_cls = request_attended[:, 0, :]  # (batch_size, hidden_size)
+        chat_cls = chat_attended[:, 0, :]        # (batch_size, hidden_size)
+        
+        # 크로스 모달 어텐션 적용
+        request_with_chat_context = self.request_to_chat_attention(request_attended, chat_attended)
+        chat_with_request_context = self.chat_to_request_attention(chat_attended, request_attended)
+        
+        # 크로스 어텐션 후 [CLS] 토큰 추출
+        request_cross_cls = request_with_chat_context[:, 0, :]  # (batch_size, hidden_size)
+        chat_cross_cls = chat_with_request_context[:, 0, :]     # (batch_size, hidden_size)
+        
+        # 요청서 특징 처리
+        request_features = self.request_projection(request_cross_cls)
+        
+        # 채팅 특징 처리
+        chat_features = self.chat_projection(chat_cross_cls)
+        
+        # 요청서와 채팅 특징 결합
+        combined_features = torch.cat([request_features, chat_features], dim=1)
+        combined_features = self.layer_norm3(combined_features)
+        combined_features = self.combined_projection(combined_features)
+        
+        # 서비스 유형 분류 (요청서 특징 기반)
+        service_type_logits = self.service_type_classifier(request_features)
+        
+        # 적합도 분류를 위한 모든 특징 결합
+        final_features = torch.cat([request_features, chat_features, combined_features], dim=1)
+        final_features = self.dropout(final_features)
+        
+        # 적합도 분류
+        logits = self.classifier(final_features)
+        probabilities = torch.softmax(logits, dim=1)
+        
+        return logits, probabilities, service_type_logits
+
+def get_device():
+    """
+    사용 가능한 디바이스(CPU/GPU)를 반환하는 함수
+    
+    Returns:
+        torch.device: 사용할 디바이스
+    """
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def save_model(model, tokenizer, output_dir):
+    """
+    모델과 토크나이저를 저장하는 함수
+    
+    Args:
+        model: 저장할 모델
+        tokenizer: 저장할 토크나이저
+        output_dir (str): 저장할 디렉토리 경로
+    """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # 모델 저장
+    model_path = os.path.join(output_dir, 'model.pt')
+    torch.save(model.state_dict(), model_path)
+    
+    # 토크나이저 저장
+    tokenizer_path = os.path.join(output_dir, 'tokenizer')
+    tokenizer.save_pretrained(tokenizer_path)
+    
+    print(f"모델이 저장되었습니다: {model_path}")
+    print(f"토크나이저가 저장되었습니다: {tokenizer_path}")
+
+def extract_qa_pairs(text):
+    """요청서 텍스트에서 질문-답변 쌍을 추출하는 함수"""
+    qa_pairs = []
+    lines = text.split('\n')
+    for i in range(len(lines)):
+        line = lines[i]
+        if '[Q]' in line and i + 1 < len(lines) and '[A]' in lines[i + 1]:
+            question = line.split('[Q]')[1].strip()
+            answer = lines[i + 1].split('[A]')[1].strip()
+            if answer and answer != '고수와 상담시 논의할게요':
+                qa_pairs.append((question, answer))
+    return qa_pairs
+
+def load_service_descriptions(json_path, tokenizer, model, device):
+    """서비스 설명을 로드하고 사전 인코딩하는 함수"""
+    if not os.path.exists(json_path):
+        print(f"경고: 서비스 설명 파일 {json_path}가 존재하지 않습니다.")
+        # 기본 설명 제공
+        descriptions = {
+            "입주청소": "입주 전 새집을 청소하는 서비스",
+            "이사청소": "이사를 가면서 전 집을 청소하는 서비스", 
+            "거주청소": "현재 살고 있는 집을 청소하는 서비스",
+            "기타청소": "기타 특수 목적의 청소 서비스"
+        }
+    else:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            service_data = json.load(f)
+            # service_descriptions.json의 format에 따라 구조 변경
+            if "service_description" in service_data:
+                descriptions = {
+                    "입주청소": service_data["service_description"],
+                    "이사청소": service_data["service_description"],
+                    "거주청소": service_data["service_description"],
+                    "기타청소": service_data["service_description"]
+                }
+            else:
+                descriptions = service_data
+    
+    encoded_descriptions = {}
+    for service_id, desc in descriptions.items():
+        inputs = tokenizer(
+            desc,
+            add_special_tokens=True,
+            max_length=512,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model(**inputs)
+            # CLS 토큰 임베딩 저장
+            encoded_descriptions[service_id] = outputs.last_hidden_state[:, 0, :]
+    
+    return encoded_descriptions
+
+class ImprovedSoomgoServiceClassifier(nn.Module):
+    """
+    개선된 숨고 서비스 분류기
+    QA 관계 분석과 서비스 설명 관계 분석을 통해 서비스 적합도를 판단합니다.
+    """
+    def __init__(self, model_name='klue/bert-base', num_heads=8):
+        super(ImprovedSoomgoServiceClassifier, self).__init__()
+        
+        # BERT 모델 로드
+        self.bert = AutoModel.from_pretrained(model_name)
+        hidden_size = self.bert.config.hidden_size
+        
+        # QA 관계 분석을 위한 어텐션
+        self.qa_attention = MultiHeadAttention(hidden_size, num_heads)
+        self.qa_cross_attention = CrossModalAttention(hidden_size)
+        
+        # 서비스 설명 관계 분석을 위한 어텐션
+        self.service_attention = MultiHeadAttention(hidden_size, num_heads)
+        self.service_cross_attention = CrossModalAttention(hidden_size)
+        
+        # 특징 결합
+        self.qa_projection = nn.Linear(hidden_size, hidden_size)
+        self.service_projection = nn.Linear(hidden_size, hidden_size)
+        self.combined_projection = nn.Linear(hidden_size * 3, hidden_size)  # QA, Service, Original
+        
+        # 분류기
+        self.dropout = nn.Dropout(0.2)
+        self.classifier = nn.Linear(hidden_size, 2)  # Binary classification
+        
+        # 레이어 정규화
+        self.layer_norm1 = nn.LayerNorm(hidden_size)
+        self.layer_norm2 = nn.LayerNorm(hidden_size)
+        self.layer_norm3 = nn.LayerNorm(hidden_size)
+        
+    def forward(self, input_ids, attention_mask, qa_pairs=None, service_desc=None):
+        """
+        모델 순전파
+        
+        Args:
+            input_ids: 입력 텍스트의 토큰 ID
+            attention_mask: 어텐션 마스크
+            qa_pairs: Q&A 쌍 텐서 (선택적)
+            service_desc: 서비스 설명 텐서 (선택적)
+            
+        Returns:
+            tuple: (로짓, 확률값)
+        """
+        # 기본 BERT 인코딩
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_states = outputs.last_hidden_state
+        
+        # QA 관계 분석
+        if qa_pairs is not None:
+            qa_attended = self.qa_attention(hidden_states)
+            qa_cross = self.qa_cross_attention(qa_attended, qa_pairs)
+            qa_features = self.qa_projection(qa_cross)
+            qa_features = self.layer_norm1(qa_features)
+        else:
+            qa_features = torch.zeros_like(hidden_states)
+        
+        # 서비스 설명 관계 분석
+        if service_desc is not None:
+            service_attended = self.service_attention(hidden_states)
+            service_cross = self.service_cross_attention(service_attended, service_desc)
+            service_features = self.service_projection(service_cross)
+            service_features = self.layer_norm2(service_features)
+        else:
+            service_features = torch.zeros_like(hidden_states)
+        
+        # 특징 결합
+        combined = torch.cat([hidden_states, qa_features, service_features], dim=-1)
+        combined = self.combined_projection(combined)
+        combined = self.layer_norm3(combined)
+        
+        # 분류
+        pooled = torch.mean(combined, dim=1)  # Global average pooling
+        pooled = self.dropout(pooled)
+        logits = self.classifier(pooled)
+        
+        return logits, torch.softmax(logits, dim=-1)
+
+def load_model(model_path, tokenizer_path, device, use_improved=False):
+    """
+    저장된 모델과 토크나이저를 로드하는 함수 (개선된 모델 추가)
+    
+    Args:
+        model_path (str): 모델 가중치 파일 경로
+        tokenizer_path (str): 토크나이저 파일 경로
+        device: 사용할 디바이스
+        use_improved (bool): 개선된 모델 사용 여부
+        
+    Returns:
+        tuple: (모델, 토크나이저)
+    """
+    default_model_name = 'klue/bert-base'
+    model_name = default_model_name
+    tokenizer = None
+
+    # 1. 저장된 토크나이저 로드 시도
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        # 로드된 토크나이저 경로에서 config 로드 시도 (존재 확인용)
+        _ = AutoConfig.from_pretrained(tokenizer_path) 
+        model_name = tokenizer_path # 성공하면 저장된 경로 사용
+        print(f"저장된 토크나이저 로드 성공: {tokenizer_path}")
+    except OSError:
+        print(f"'{tokenizer_path}'에서 토크나이저 또는 config.json 로드 실패.")
+        tokenizer = None # 실패 시 초기화
+    except Exception as e:
+        print(f"토크나이저 로드 중 예상치 못한 오류 발생: {e}")
+        tokenizer = None
+
+    # 2. 토크나이저 로드 실패 시 기본값 사용 및 저장
+    if tokenizer is None:
+        print(f"기본 토크나이저({default_model_name})를 로드합니다.")
+        model_name = default_model_name
+        tokenizer = AutoTokenizer.from_pretrained(default_model_name)
+        
+        # 다음 실행을 위해 기본 토크나이저 저장 시도
+        try:
+            if not os.path.exists(tokenizer_path):
+                os.makedirs(tokenizer_path)
+            tokenizer.save_pretrained(tokenizer_path)
+            print(f"기본 토크나이저를 '{tokenizer_path}'에 저장했습니다.")
+        except Exception as e:
+            print(f"기본 토크나이저 저장 실패: {e}")
+
+    # 3. 모델 초기화 및 가중치 로드
+    print(f"모델 초기화 ({model_name}) 및 가중치 로드 중...")
+    
+    # 개선된 모델 사용 여부에 따라 다른 클래스 사용
+    if use_improved:
+        model = ImprovedSoomgoServiceClassifier(model_name=model_name)
+        print("개선된 모델(ImprovedSoomgoServiceClassifier)을 사용합니다.")
+    else:
+        model = SoomgoServiceClassifier(model_name=model_name)
+        print("기존 모델(SoomgoServiceClassifier)을 사용합니다.")
+    
+    try:
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        print(f"모델 가중치 로드 성공: {model_path}")
+    except FileNotFoundError:
+        print(f"경고: 모델 파일 '{model_path}'를 찾을 수 없습니다. 모델 가중치가 초기화됩니다.")
+    except Exception as e:
+        print(f"모델 가중치 로드 중 오류 발생: {e}")
+        print("모델 가중치가 초기화됩니다.")
+    
+    model = model.to(device)
+    model.eval()  # 평가 모드로 설정
+    
+    return model, tokenizer 

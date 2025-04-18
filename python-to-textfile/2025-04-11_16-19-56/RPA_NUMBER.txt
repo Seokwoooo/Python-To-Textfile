@@ -1,0 +1,873 @@
+import time
+import logging
+import sys
+import os
+import traceback # traceback import 추가 (오류 로깅에 사용)
+import gspread
+import collections
+from google.oauth2.service_account import Credentials # gspread 인증 라이브러리 통일
+
+# Selenium 관련 import
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    NoSuchWindowException,
+    TimeoutException,
+    WebDriverException,
+    UnexpectedAlertPresentException,
+    NoAlertPresentException # Alert 처리에 필요
+)
+from selenium.webdriver.common.keys import Keys # Keys import 추가 (사용된 경우 대비)
+
+# --- 새로 만든 로그인 유틸리티 함수 import ---
+# 이 import 구문이 작동하려면 soomgo_login_util.py 파일이 동일 폴더 또는 PYTHONPATH에 있어야 합니다.
+from soomgo_login_util import get_soomgo_driver
+
+# --- 로깅 설정 (파일 이름은 원본 유지) ---
+# 파일 핸들러와 스트림 핸들러를 사용하는 설정
+logging.basicConfig(
+    level=logging.INFO,  # INFO 이상만 출력 (DEBUG 제외)
+    format='%(asctime)s [%(levelname)s] %(filename)s:%(lineno)d - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        # 로그 파일 경로를 C:/Soomgo/ 폴더로 지정 (폴더가 존재해야 함)
+        logging.FileHandler(r"C:\Soomgo\output_all_invalidNumber.txt", encoding="utf-8"), # 원본 로그 파일명 사용
+        logging.StreamHandler(sys.stdout) # 콘솔 출력 핸들러
+    ]
+)
+logging.info("--------------------------------------------------------------\n\n")
+logging.info("잘못된 전화번호 RPA 프로세스 시작") # 원본 로그 메시지 사용
+
+# --- 전역 변수 선언 (원본 유지) ---
+driver = None # WebDriver 객체, main 함수에서 초기화됨
+global_startCell = 0
+global_endCell = 0
+global_UpdateSheetCellPos = []
+global_UpdateSheetCellText = []
+
+#* Reset Var (원본 유지)
+# Title Var
+g_Classification      = ""
+g_Compensation        = ""
+g_Reward              = ""
+g_Sec_Classification  = ""
+g_Detailed_Reason     = ""
+startCell_as_string   = ""
+endCell_as_string     = ""
+
+# Display Progress
+gd_Status             = ""
+gd_Progress_Percent   = ""
+gd_ETA                = ""
+
+# Display Result
+gd_RPA_Result   = ""
+gd_RPA_Detail   = ""
+gd_RPA_Error    = ""
+
+#* Cell Row (원본 유지)
+cellRow_Classification      = "M"
+cellRow_Compensation        = "N"
+cellRow_Reward              = "O"
+cellRow_Sec_Classification  = "P"
+cellRow_Detailed_Reason     = "Q"
+cellRow_RPA_Result          = "S"
+cellRow_RPA_Detail          = "T"
+cellRow_RPA_Error           = "U"
+cellRow_Url                 = "E"
+cellRow_Report_Date         = "B"
+cellRow_Reporter_ID         = "C"
+
+#* Absolute Cell (원본 유지)
+absCell_Status              = "M2"
+absCell_Progress_Percent    = "O2"
+absCell_ETA                 = "Q2"
+absCell_StartCell           = "C3"
+absCell_EndCell             = "C4"
+
+#* Calculation Var (원본 유지)
+saved_Running_Time_List = collections.deque(maxlen=5)
+start_Time = 0
+# end_Time 변수는 사용되지 않아 주석 처리 또는 삭제 가능 (원본에 있었으면 유지)
+# end_Time = 0
+
+# --- Google Sheets API 연결 (워크시트 이름 원본 유지) ---
+logging.info("Google Sheets API 연결 시작")
+# json_key 변수명 및 경로 원본 유지
+json_key = "C:/Soomgo/soomgo-lucian-python-8b307b229260.json" # 실제 경로 확인 필요
+try:
+    # scope 변수명 및 내용 원본 유지 (필요한 권한 포함)
+    scope = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/auth/spreadsheets',
+             "https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]
+    # 인증 방식 통일 (google-auth 사용)
+    creds = Credentials.from_service_account_file(json_key, scopes=scope)
+    gc = gspread.authorize(creds)
+
+    # sheet_url 변수명 및 URL 원본 유지
+    sheet_url = "https://docs.google.com/spreadsheets/d/113wd2xQ1Vy-XhwdaEbIz4FOca7QFGFzz129rKtycdQE/edit?usp=sharing"
+    sheet_key = sheet_url.split('/')[5]
+    doc = gc.open_by_key(sheet_key)
+    # sheet 변수명 및 워크시트 이름 원본 유지 ("PRA) Invalid Number")
+    sheet = doc.worksheet("PRA) Invalid Number") # *** RPA_NUMBER 원본 워크시트 이름 사용 ***
+    logging.info(f"Google Sheets '{doc.title}' 스프레드시트의 'PRA) Invalid Number' 워크시트 연결 완료.") # 로그 메시지 수정
+except Exception as e:
+    logging.error(f"Google Sheets 연결 실패: {e}", exc_info=True)
+    logging.error("Google Sheets에 연결할 수 없어 스크립트를 종료합니다.")
+    sys.exit(1) # 시트 연결 실패 시 종료
+
+# --- Helper Functions (PRO와 구조 동일, ContinueNotice 내용만 NUMBER 원본 유지) ---
+
+# Unified logging helper (PRO와 동일)
+def loggin(level, message):
+    level = level.lower()
+    if level == 'info':
+        logging.info(message)
+    elif level == 'warning':
+        logging.warning(message)
+    elif level == 'error':
+        logging.error(message)
+    else:
+        logging.debug(message) # 기본값은 debug 레벨
+
+# Reset 함수 (PRO와 동일)
+def Reset():
+    logging.info("Reset 함수 시작: 시작/종료 셀 확인 및 초기화")
+    global global_startCell, global_endCell, startCell_as_string, endCell_as_string # 전역 변수 사용 명시
+    try:
+        logging.info("시트 상태 확인 중...")
+        status = sheet.get(absCell_Status)
+        startCell = sheet.get(absCell_StartCell)
+        endCell = sheet.get(absCell_EndCell)
+
+        status_as_string = "".join(["".join(row) for row in status])
+        startCell_as_string = "".join(["".join(row) for row in startCell])
+        endCell_as_string = "".join(["".join(row) for row in endCell])
+
+        logging.info(f"현재 상태: {status_as_string}")
+        logging.info(f"시작 셀: {startCell_as_string}")
+        logging.info(f"종료 셀: {endCell_as_string}")
+
+        # 상태 체크 로직 원본 유지
+        if status_as_string == "RPA Running..":
+            loggin('warning', "⚠️ Error: 이미 해당 RPA가 실행 중입니다.")
+            logging.error("RPA가 이미 실행 중, 종료합니다.")
+            sys.exit(0)
+        elif startCell_as_string == "" or startCell_as_string == " ":
+            loggin('warning', "⚠️ Error: Start Cell 값이 비어있습니다. Google Sheet에서 수정 후 다시 시도해주세요.")
+            logging.error("시작 셀이 비었음, 종료합니다.")
+            sys.exit(0)
+        elif endCell_as_string == "" or endCell_as_string == " ":
+            loggin('warning', "⚠️ Error: End Cell 값이 비어있습니다. Google Sheet에서 수정 후 다시 시도해주세요.")
+            logging.error("종료 셀이 비었음, 종료합니다.")
+            sys.exit(0)
+
+        # 전역 변수 업데이트
+        global_startCell = int(startCell_as_string)
+        global_endCell = int(endCell_as_string)
+
+        logging.info(f"시작 셀 번호: {global_startCell}")
+        logging.info(f"종료 셀 번호: {global_endCell}")
+
+        # 시작 셀 범위 체크 원본 유지
+        if global_startCell < 7:
+            loggin('warning', "⚠️ Error: StartCell 값이 보호범위인 7보다 작습니다. Google Sheet에서 수정 후 다시 시도해주세요.")
+            logging.error("시작 셀이 최소값 7보다 작음, 종료합니다.")
+            sys.exit(0)
+
+        logging.info("Reset 함수 성공적으로 완료")
+    except Exception as e:
+        logging.error(f"Reset 함수 오류: {e}", exc_info=True)
+        loggin('warning', f"⚠️ Reset Error: 초기화 중 알 수 없는 오류 발생. 상세사유: {e}")
+        sys.exit(1)
+
+# ListToString 함수 (PRO와 동일)
+def ListToString(cellPos):
+    logging.debug(f"ListToString 함수 호출: 셀 {cellPos}의 값 읽기") # 로그 레벨 변경 가능
+    try:
+        data = sheet.get(cellPos)
+        str_Data = "".join(["".join(row) for row in data])
+        logging.debug(f"셀 {cellPos}의 값: '{str_Data}'") # 로그 레벨 변경 가능
+        return str_Data
+    except Exception as e:
+        logging.error(f"ListToString 함수 오류 (셀 {cellPos}): {e}")
+        loggin('warning', f"⚠️ ListToString Error: 알 수 없는 오류 발생. 상세사유: {e}")
+        return "A_Error" # 오류 발생 시 반환 값
+
+# Calculate_Left_Time 함수 (PRO와 동일)
+def Calculate_Left_Time(i):
+    logging.debug(f"Calculate_Left_Time 함수 호출: 현재 인덱스 {i}") # 로그 레벨 변경 가능
+    global global_startCell, global_endCell # 전역 변수 사용 명시
+    try:
+        if i == global_endCell:
+            logging.info("마지막 셀 처리 완료. ETA 업데이트.")
+            SavedUpdateSheetValues(absCell_ETA, "✅ Done!")
+            return
+
+        if i < global_startCell + 5:
+            logging.info("초기 단계, 예상 시간 계산 중...")
+            SavedUpdateSheetValues(absCell_ETA, "⌛ 계산 중...")
+            return
+        else:
+            logging.debug(f"실행 시간 목록: {list(saved_Running_Time_List)}") # 로그 레벨 변경 가능
+            if not saved_Running_Time_List:
+                 SavedUpdateSheetValues(absCell_ETA, "⌛ 계산 중...")
+                 return
+
+            weights = list(range(1, len(saved_Running_Time_List) + 1))
+            weighted_sum = sum(t * w for t, w in zip(saved_Running_Time_List, weights))
+            total_weights = sum(weights)
+            if total_weights == 0:
+                SavedUpdateSheetValues(absCell_ETA, "⌛ 계산 중...")
+                return
+
+            mean = weighted_sum / total_weights
+            left_Row = global_endCell - i
+            expected_Time = mean * left_Row
+
+            logging.debug(f"가중 평균 실행 시간: {mean:.2f}초") # 로그 레벨 변경 가능
+            logging.debug(f"남은 행 수: {left_Row}") # 로그 레벨 변경 가능
+            logging.info(f"예상 남은 시간: {expected_Time:.2f}초")
+
+            if expected_Time > 60:
+                min_val = expected_Time // 60
+                sec_val = expected_Time % 60
+            else:
+                min_val = 0
+                sec_val = expected_Time
+
+            time_text = f"{min_val:.0f}분 {sec_val:.1f}초 남았습니다."
+            logging.info(f"ETA 업데이트: {time_text}")
+            SavedUpdateSheetValues(absCell_ETA, time_text)
+    except Exception as e:
+        logging.error(f"Calculate_Left_Time 함수 오류: {e}", exc_info=True)
+        loggin('warning', f"⚠️ Calculate Time Error: 알 수 없는 오류 발생. 상세사유: {e}")
+        SavedUpdateSheetValues(absCell_ETA, "⚠️ 계산 오류")
+
+# ErrorNotice 함수 (PRO와 동일)
+def ErrorNotice(e, i):
+    logging.error(f"ErrorNotice 함수 호출: 행 {i}에서 오류 발생")
+    logging.error(f"오류 정보: {str(e)}")
+
+    ec = " ".join([line.lstrip() for line in str(e).splitlines()])
+    logging.info(f"시트 {i}행에 오류 표시 중...")
+    SavedUpdateSheetValues(f"{cellRow_RPA_Result}{i}", "⚠️")
+    SavedUpdateSheetValues(f"{cellRow_RPA_Error}{i}", f"{ec}")
+    SavedUpdateSheetValues(f"{cellRow_RPA_Detail}{i}", "오류발생, 해당 신고건은 수동으로 처리해야 합니다.")
+    logging.info(f"행 {i}에 오류 표시 완료 (저장됨)")
+
+# *** ContinueNotice 함수 (RPA_NUMBER 원본 로직 사용) ***
+def ContinueNotice(result, i):
+    logging.info(f"ContinueNotice 함수 호출: 행 {i}, 결과 '{result}'")
+
+    if result == "NormalNumber":
+        logging.info(f"행 {i}: 정상 전화번호 확인")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Result}{i}", "✅")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Detail}{i}", "해당 고객의 전화번호는 모두 정상입니다.")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Error}{i}", "") # 오류 없음
+
+        # result 값 자동 입력 (원본 로직 유지)
+        SavedUpdateSheetValues(f"{cellRow_Classification}{i}", "기준미달")
+        SavedUpdateSheetValues(f"{cellRow_Compensation}{i}", "미해당")
+        SavedUpdateSheetValues(f"{cellRow_Sec_Classification}{i}", "신고사유에 미해당")
+
+        loggin('info', f"✅ {i}번째: 해당 고객의 전화번호는 모두 정상입니다.")
+        # SheetUpdatePost(i) # 즉시 업데이트할지 여부 (여기서는 모으는 방식 유지)
+
+    elif result == "CorrectInvalidNumber":
+        logging.info(f"행 {i}: 유효하지 않은 전화번호 확인")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Result}{i}", "✔️")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Detail}{i}", "유효하지 않는 전화번호 대상 고객입니다.")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Error}{i}", "") # 오류 없음
+        loggin('info', f"✔️ Google Sheet {i}번째: 유효하지 않는 전화번호 대상 고객입니다.")
+        # SheetUpdatePost(i)
+
+    elif result =="NoPhoneNumber":
+        logging.info(f"행 {i}: 휴대폰번호 없음")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Result}{i}", "📵")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Detail}{i}", "피신고인 휴대폰번호가 존재하지 않습니다.")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Error}{i}", "") # 오류 없음
+        loggin('info', f"📵 Google Sheet {i}번째: 피신고인 휴대폰번호가 존재하지 않습니다.")
+        # SheetUpdatePost(i)
+
+    elif result =="Unsubscribe":
+        logging.info(f"행 {i}: 탈퇴 회원")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Result}{i}", "🚫")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Detail}{i}", "피신고인은 탈퇴 회원입니다. 수동으로 확인 및 처리해야 합니다.")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Error}{i}", "") # 오류 없음
+        loggin('info', f"🚫 Google Sheet {i}번째: 피신고인은 탈퇴 회원입니다. 수동으로 확인 및 처리해야 합니다.")
+        # SheetUpdatePost(i)
+
+    elif result =="NotNormalPhoneNumber":
+        logging.info(f"행 {i}: 비정상 전화번호 형식")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Result}{i}", "❌")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Detail}{i}", "피신고인의 전화번호는 일반적이지 않아, 수동으로 확인 및 처리해야 합니다.")
+        SavedUpdateSheetValues(f"{cellRow_RPA_Error}{i}", "") # 오류 없음
+        loggin('info', f"❌ Google Sheet {i}번째: 피신고인의 전화번호는 일반적이지 않아, 수동으로 확인 및 처리해야 합니다.")
+        # SheetUpdatePost(i)
+
+    # 그 외의 result 값 처리 (필요 시 추가)
+    # else:
+    #     logging.warning(f"행 {i}: 알 수 없는 결과값 '{result}'")
+    #     SavedUpdateSheetValues(f"{cellRow_RPA_Result}{i}", "❓")
+    #     SavedUpdateSheetValues(f"{cellRow_RPA_Detail}{i}", f"알 수 없는 결과: {result}")
+    #     SavedUpdateSheetValues(f"{cellRow_RPA_Error}{i}", "")
+
+    logging.info(f"행 {i}에 결과 표시 완료 (저장됨): {result}")
+
+
+# SavedUpdateSheetValues 함수 (PRO와 동일)
+def SavedUpdateSheetValues(cellPos, text):
+    logging.debug(f"SavedUpdateSheetValues 함수 호출: 셀 {cellPos}, 값 '{text}'") # 로그 레벨 변경 가능
+    global global_UpdateSheetCellPos, global_UpdateSheetCellText # 전역 변수 사용 명시
+    global_UpdateSheetCellPos.append(cellPos)
+    global_UpdateSheetCellText.append(text)
+
+# SheetUpdatePost 함수 (PRO와 동일)
+def SheetUpdatePost(current_index):
+    logging.info(f"SheetUpdatePost 함수 호출: 현재 인덱스 {current_index}")
+    global global_UpdateSheetCellPos, global_UpdateSheetCellText, start_Time, saved_Running_Time_List # 전역 변수 사용 명시
+
+    end_time = time.time()
+    if start_Time > 0:
+        execution_time = end_time - start_Time
+        saved_Running_Time_List.append(execution_time)
+        logging.info(f"이번 행 실행 시간: {execution_time:.2f}초")
+    else:
+        logging.warning("start_Time이 설정되지 않아 실행 시간을 기록할 수 없습니다.")
+
+    if global_startCell == current_index:
+        logging.info("첫 번째 행 처리, RPA 실행 중 상태로 변경")
+        SavedUpdateSheetValues(absCell_Status, "RPA Running..")
+
+    try:
+        if global_UpdateSheetCellPos and global_UpdateSheetCellText:
+            logging.info(f"구글 시트 업데이트 항목 수: {len(global_UpdateSheetCellPos)}")
+
+            updates = []
+            for pos, text in zip(global_UpdateSheetCellPos, global_UpdateSheetCellText):
+                updates.append({
+                    "range": pos,
+                    "values": [[str(text)]]
+                })
+
+            logging.info("sheet.batch_update 호출 중...")
+            sheet.batch_update(updates)
+            loggin('info', f"✅ Google Sheet Update 성공. 업데이트 개수: {len(global_UpdateSheetCellPos)}")
+
+            for pos, text in zip(global_UpdateSheetCellPos, global_UpdateSheetCellText):
+                logging.debug(f"🔃 업데이트한 셀: {pos}, 값: {text}")
+
+            logging.info("구글 시트 업데이트 완료")
+        else:
+            logging.info("구글 시트에 업데이트할 내용이 없습니다.")
+
+    except Exception as e:
+        logging.error(f"SheetUpdatePost 오류: {e}", exc_info=True)
+        loggin('warning', f"!!! Sheet Update Post 중 오류 발생: {e}")
+
+    logging.debug("업데이트 목록 초기화")
+    global_UpdateSheetCellText = []
+    global_UpdateSheetCellPos = []
+
+# --- 치명적 예외 처리 함수 (PRO와 동일 구조, 세션 복구 로직 제거됨) ---
+def critical_exception(e, context, i):
+    global driver
+    loggin('warning', f"⚠️ critical_exception 발생: {context}")
+    logging.error(f"예외 정보: {str(e)}")
+    logging.error(f"예외 타입: {type(e).__name__}")
+    logging.error(f"상세 Traceback:\n{traceback.format_exc()}")
+
+    logging.error(f"치명적 오류로 RPA 종료: {context}")
+    try:
+        SavedUpdateSheetValues(absCell_Status, "⚠️ RPA Error")
+        SavedUpdateSheetValues(absCell_ETA, "-")
+        ErrorNotice(e, i)
+        SheetUpdatePost(i)
+    except Exception as sheet_update_err:
+        logging.error(f"오류 상태 시트 업데이트 중 추가 오류 발생: {sheet_update_err}")
+
+    loggin('warning', f"Google Sheet [{i}]번째 신고 건 / ⚠️ {context}에서 예외 발생하여 RPA 종료: {e}")
+
+    if driver:
+        try:
+            logging.info("드라이버 종료 시도...")
+            driver.quit()
+            logging.info("드라이버 종료 완료.")
+        except Exception as quit_err:
+            logging.warning(f"드라이버 종료 중 오류 발생: {quit_err}")
+    logging.info("프로그램 종료.")
+    sys.exit(1)
+
+# --- 핵심 RPA 작업 로직 함수 (main_task - RPA_NUMBER 원본 로직 사용 + TimeoutException 처리) ---
+def main_task():
+    logging.info("main_task 시작: 잘못된 번호 처리 루프 진입")
+    global start_Time, driver # 전역 변수 사용 명시
+
+    # 메인 로직: for문을 통해 각 신고 건을 처리 (RPA_NUMBER 원본 로직)
+    for i in range(global_startCell, global_endCell + 1):
+        start_Time = time.time() # 각 행 처리 시작 시간 기록
+        logging.info(f"===== 행 {i} 처리 시작 =====")
+        try:
+            # 진행률 및 ETA 계산
+            Calculate_Left_Time(i)
+            progress_percent = ((i - global_startCell + 1) / (global_endCell - global_startCell + 1)) * 100
+            SavedUpdateSheetValues(absCell_Progress_Percent, f"{progress_percent:.1f}%")
+
+            result = "" # 결과 변수 초기화
+
+            # 유효성 검사 (원본 로직)
+            logging.info(f"행 {i}: 유효성 검사")
+            report_Date = ListToString(f"{cellRow_Report_Date}{i}").strip()
+            reporter_ID = ListToString(f"{cellRow_Reporter_ID}{i}").strip()
+
+            if report_Date == "" or reporter_ID == "":
+                logging.warning(f"행 {i}: 필수 정보(신고자ID 또는 신고일) 누락")
+                loggin('warning', f"Google Sheet [{i}]번째 신고 건 / ⚠️Sheet에 필수 정보인 신고자ID 또는 신고일 값이 없습니다.")
+                ErrorNotice("필수 정보 누락 (신고자ID 또는 신고일)", i)
+                SheetUpdatePost(i)
+                continue
+
+            # Step 1: Force URL 접속 후 '탈퇴'인지 체크 (원본 로직)
+            logging.info(f"행 {i}: Step 1 시작 - Force URL 접속 후 상태 확인")
+            phoneNumber = "" # 전화번호 변수 초기화
+            url = ListToString(f"{cellRow_Url}{i}")
+            if url == "A_Error":
+                logging.error(f"행 {i}: URL 읽기 실패 (A_Error)")
+                ErrorNotice("URL 읽기 오류", i)
+                SheetUpdatePost(i)
+                continue
+            if not url.startswith("http"):
+                 logging.error(f"행 {i}: 유효하지 않은 URL '{url}', 건너<0xEB><0><0x8E><0x84>니다.")
+                 ErrorNotice(f"Invalid URL: {url}", i)
+                 SheetUpdatePost(i)
+                 continue
+
+            logging.info(f"행 {i}: URL 접속 중 - {url}")
+            driver.get(url)
+
+            # 회원 상태 확인 (원본 XPath 유지)
+            logging.info(f"행 {i}: 회원 상태 확인 중")
+            status_xpath = '//*[@id="root"]/div/main/div[2]/div[2]/div[1]/div[1]/div[2]/table/tbody/tr[5]/td[2]'
+            status = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, status_xpath))
+            ).text.strip()
+            logging.info(f"행 {i}: 회원 상태 - '{status}'")
+
+            if "탈퇴" in status:
+                logging.info(f"행 {i}: 탈퇴 회원 확인됨")
+                result = "Unsubscribe"
+                ContinueNotice(result, i)
+                SheetUpdatePost(i)
+                continue
+
+            # 전화번호 null인지 검사 (원본 로직)
+            logging.info(f"행 {i}: 휴대폰 번호 확인 시작")
+            phone_xpath = '//*[@id="root"]/div/main/div[2]/div[2]/div[1]/div[1]/div[2]/table/tbody/tr[11]/td[2]'
+            elem = WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.XPATH, phone_xpath))
+            )
+            logging.info(f"행 {i}: 휴대폰 번호 요소 찾음, 값: '{elem.text}'")
+            phone_text = elem.text.strip() # 공백 제거 후 사용
+
+            if phone_text != "":
+                phoneNumber = phone_text
+                logging.info(f"행 {i}: 휴대폰 번호 있음 - {phoneNumber}")
+                # 전화번호 형식 검사 (010 시작 여부 - 원본 로직)
+                if not phoneNumber.startswith("010"):
+                    logging.info(f"행 {i}: 비정상 형식 휴대폰 번호 - {phoneNumber}")
+                    result = "NotNormalPhoneNumber"
+                    ContinueNotice(result, i)
+                    SheetUpdatePost(i)
+                    continue
+                # 형식 검사 통과 시 계속 진행
+            else: # 전화번호가 비어있는 경우
+                logging.info(f"행 {i}: 휴대폰 번호 없음")
+                result = "NoPhoneNumber"
+                ContinueNotice(result, i)
+                SheetUpdatePost(i)
+                continue
+
+            # Step 2: 신고 건의 서비스 카테고리 크롤링 (RPA_NUMBER 원본 로직 - 견적 버튼 확인 및 안심번호 확인)
+            logging.info(f"행 {i}: Step 2 시작 - 견적 및 안심번호 정보 확인")
+
+            # 신고일/신고자 ID 매칭 (RPA_PRO 로직 재사용 - 필요 시 수정)
+            logging.info(f"행 {i}: 피신고 내역 확인 위해 '{url}?size=100' 접속")
+            driver.get(f"{url}?size=100")
+            time.sleep(2) # 원본 유지
+
+            elements_xpath = '//*[@id="root"]/div/main/div[2]/div[2]/div[2]/div[3]/div/div[3]/div/table/tbody/tr'
+            elements = WebDriverWait(driver, 20).until(
+                EC.presence_of_all_elements_located((By.XPATH, elements_xpath))
+            )
+            loggin('info', f"Google Sheet [{i}]번째 신고 건 / Force1 피신고내역에서 [{len(elements)}] 건의 신고내역을 찾아 처리합니다.")
+
+            matching_rows_index = []
+            for index in range(1, len(elements) + 1):
+                try:
+                    date_xpath = f'//*[@id="root"]/div/main/div[2]/div[2]/div[2]/div[3]/div/div[3]/div/table/tbody/tr[{index}]/td[8]'
+                    full_date_element = WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located((By.XPATH, date_xpath))
+                    )
+                    date_only = full_date_element.text.split(" ")[0]
+                    loggin('info', f"Google Sheet [{i}]번째 신고 건 / @ Row {index} 날짜: {date_only}")
+                    if date_only == report_Date:
+                        loggin('info', f"Google Sheet [{i}]번째 신고 건 / @ 날짜 일치 (Row {index})")
+                        matching_rows_index.append(index)
+                except (NoSuchWindowException, WebDriverException) as e:
+                     logging.error(f"행 {i}, Row {index}: WebDriver 오류 발생 (Step 2 - 날짜 추출)")
+                     critical_exception(e, f"날짜 추출 중 오류 (Row {index})", i)
+                except Exception as e:
+                    loggin('warning', f"Google Sheet [{i}]번째 신고 건 / ⚠️ 날짜 추출 중 오류 (Row {index}): {e}")
+
+            loggin('info', f"Google Sheet [{i}]번째 신고 건 / @ 날짜 일치 행 인덱스: {matching_rows_index}")
+            if not matching_rows_index:
+                loggin('error', f"Google Sheet [{i}]번째 신고 건 / 신고일({report_Date})과 일치하는 피신고 내역을 찾을 수 없습니다.")
+                raise Exception("신고일과 일치하는 피신고내역을 1개도 찾을 수 없어 예외발생")
+
+            find_Correct_Reportlist_row = -1
+            error_occurred_in_id_check = False
+            for n in matching_rows_index:
+                logging.info(f"행 {i}, Row {n}: 신고자 ID 확인 위해 상세 페이지 이동 시도")
+                driver.get(f"{url}?size=100")
+                time.sleep(1)
+                try:
+                    if len(elements) == 1 and index == 1: # 원본 코드에서는 index 변수가 루프 밖에서 사용될 수 없음 -> n 사용하도록 수정
+                         button_xpath = '//*[@id="root"]/div/main/div[2]/div[2]/div[2]/div[3]/div/div[3]/div/table/tbody/tr/td[3]/a/button'
+                    else:
+                         button_xpath = f'//*[@id="root"]/div/main/div[2]/div[2]/div[2]/div[3]/div/div[3]/div/table/tbody/tr[{n}]/td[3]/a/button'
+
+                    button = WebDriverWait(driver, 20).until(
+                        EC.element_to_be_clickable((By.XPATH, button_xpath))
+                    )
+                    button.click()
+                    logging.info(f"행 {i}, Row {n}: 상세 보기 버튼 클릭 성공")
+                    time.sleep(1)
+
+                    id_xpath = '//*[@id="root"]/div/main/div[2]/div[2]/div[1]/div[1]/div[2]/table/tbody/tr[1]/td[2]'
+                    id_text = WebDriverWait(driver, 10).until(
+                        lambda d: d.find_element(By.XPATH, id_xpath).text.strip() or False
+                    )
+                    loggin('info', f"Google Sheet [{i}]번째 신고 건 / @ Force2 고수페이지 회원번호: {id_text} (Row {n})")
+                    if reporter_ID == id_text:
+                        find_Correct_Reportlist_row = n
+                        logging.info(f"행 {i}: 신고자 ID 일치! (Row {n})")
+                        break
+                except (NoSuchWindowException, WebDriverException) as e:
+                     logging.error(f"행 {i}, Row {n}: WebDriver 오류 발생 (Step 2 - ID 확인)")
+                     critical_exception(e, f"신고자 ID 확인 중 오류 (Row {n})", i)
+                except Exception as e:
+                    loggin('warning', f"Google Sheet [{i}]번째 신고 건 / ⚠️ 버튼 클릭 또는 ID 추출 실패 (Row {n}): {e}")
+                    error_occurred_in_id_check = True
+                    # break # 오류 시 중단할지 여부
+
+            if error_occurred_in_id_check and find_Correct_Reportlist_row == -1:
+                 loggin('error', f"Google Sheet [{i}]번째 신고 건 / 모든 행에서 신고자 ID 확인 중 오류 발생 또는 불일치.")
+                 ErrorNotice("신고자 ID 확인 실패", i)
+                 SheetUpdatePost(i)
+                 continue
+
+            if find_Correct_Reportlist_row == -1:
+                 loggin('error', f"Google Sheet [{i}]번째 신고 건 / 신고일은 일치하나 신고자 ID({reporter_ID})가 일치하는 내역이 없습니다.")
+                 ErrorNotice("신고자 ID 불일치", i)
+                 SheetUpdatePost(i)
+                 continue
+
+            # 안심번호 확인 로직 시작 (RPA_NUMBER 원본)
+            logging.info(f"행 {i}: 안심번호 확인 로직 시작 (Row {find_Correct_Reportlist_row})")
+            driver.get(url) # 원래 페이지로 돌아감
+            time.sleep(1)
+            row_for_service = find_Correct_Reportlist_row # 변수명은 같지만 여기서는 안심번호 확인에 사용
+
+            # 요청서 버튼 및 견적 버튼 확인 (원본 XPath 유지)
+            # len(elements) == 1 조건 수정: find_Correct_Reportlist_row 사용
+            if len(elements) == 1 and row_for_service == 1:
+                request_Button_xpath = '//*[@id="root"]/div/main/div[2]/div[2]/div[2]/div[3]/div/div[3]/div/table/tbody/tr/td[1]/a/button'
+                estimate_Button_xpath = '//*[@id="root"]/div/main/div[2]/div[2]/div[2]/div[3]/div/div[3]/div/table/tbody/tr/td[2]/a/button'
+            else:
+                request_Button_xpath = f'//*[@id="root"]/div/main/div[2]/div[2]/div[2]/div[3]/div/div[3]/div/table/tbody/tr[{row_for_service}]/td[1]/a/button'
+                estimate_Button_xpath = f'//*[@id="root"]/div/main/div[2]/div[2]/div[2]/div[3]/div/div[3]/div/table/tbody/tr[{row_for_service}]/td[2]/a/button'
+
+            logging.info(f"행 {i}: 요청서 버튼 확인 중")
+            request_Button = WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.XPATH, request_Button_xpath))
+            )
+            logging.info(f"행 {i}: 요청서 버튼 확인됨")
+
+            has_estimate_button = False
+            if request_Button: # 요청서 버튼이 있으면 견적 버튼 확인
+                logging.info(f"행 {i}: 견적 버튼 확인 중")
+                try:
+                    estimate_Button = WebDriverWait(driver, 5).until(
+                        EC.presence_of_element_located((By.XPATH, estimate_Button_xpath))
+                    )
+                    logging.info(f"행 {i}: 견적 버튼 확인됨")
+                    has_estimate_button = True
+                except Exception as e:
+                    logging.warning(f"행 {i}: 견적 버튼 없음(URL_2가 비어있음) - {str(e)}")
+                    has_estimate_button = False
+                    # 견적 버튼 없으면 정상 번호 처리 (원본 로직)
+                    logging.info(f"행 {i}: 견적 버튼 없음, 정상 전화번호로 처리")
+                    result = "NormalNumber"
+                    ContinueNotice(result, i)
+                    SheetUpdatePost(i)
+                    continue # 다음 행으로
+
+            # 견적 버튼이 있는 경우 안심번호 확인 진행 (원본 로직)
+            if has_estimate_button:
+                try:
+                    logging.info(f"행 {i}: 견적 버튼 클릭 준비")
+                    old_Url = driver.current_url
+                    logging.info(f"행 {i}: 현재 URL: {old_Url}")
+                    # estimate_Button 변수가 try 블록 내에 있으므로 다시 찾아야 할 수 있음
+                    estimate_Button = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.XPATH, estimate_Button_xpath))
+                    )
+                    estimate_Button.click()
+                    logging.info(f"행 {i}: 견적 버튼 클릭됨, URL 변경 대기 중")
+
+                    WebDriverWait(driver, 20).until(EC.url_changes(old_Url))
+                    new_url = driver.current_url
+                    logging.info(f"행 {i}: URL 변경됨, 새 URL: {new_url}")
+
+                    # 안심번호 정보 버튼 클릭 (원본 XPath 유지)
+                    safeNumberInfoButton_xpath = '//*[@id="root"]/div/main/div[2]/div[2]/div[1]/div/div/a[2]'
+                    safeNumberInfoButton = WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located((By.XPATH, safeNumberInfoButton_xpath))
+                    )
+                    logging.info(f"행 {i}: 안심번호 정보 버튼 클릭")
+                    safeNumberInfoButton.click()
+
+                    # 안심번호 정보 테이블 로딩 대기 (원본 XPath 유지)
+                    safeNumberTable_xpath = '//*[@id="root"]/div/main/div[2]/div[2]/div[2]/table/tbody/tr'
+                    WebDriverWait(driver, 20).until(
+                        EC.presence_of_element_located((By.XPATH, safeNumberTable_xpath))
+                    )
+                    logging.info(f"행 {i}: 안심번호 정보 테이블 로딩됨")
+
+                # 안심번호 확인 WebDriver 예외 처리 (critical_exception 호출)
+                except (NoSuchWindowException, WebDriverException) as e:
+                     logging.error(f"행 {i}: WebDriver 오류 발생 (Step 2 - 안심번호 버튼 클릭)")
+                     critical_exception(e, "안심번호 버튼 클릭", i)
+                # 안심번호 확인 기타 예외 처리
+                except Exception as e:
+                    logging.error(f"행 {i}: 견적 버튼 또는 안심번호 정보 버튼 클릭 실패 - {str(e)}")
+                    loggin('warning', f"Google Sheet [{i}]번째 신고 건 / ⚠️estimate_Button 또는 safeNumberInfoButton 버튼 클릭 실패: {e}")
+                    ErrorNotice(e, i)
+                    SheetUpdatePost(i)
+                    continue
+
+                # 안심번호 상태 값 확인 (TimeoutException 처리 수정됨)
+                try:
+                    logging.info(f"행 {i}: 안심번호 정보 확인 시작")
+                    # 첫 번째 셀 확인 (데이터 없음 확인용 - 원본 로직)
+                    row_elem_xpath = '//*[@id="root"]/div/main/div[2]/div[2]/div[2]/table/tbody/tr/td'
+                    row_elem = WebDriverWait(driver, 20).until(
+                        EC.presence_of_element_located((By.XPATH, row_elem_xpath))
+                    )
+                    logging.info(f"행 {i}: 첫 번째 셀 로드됨")
+                    time.sleep(1)  # 원본 유지
+
+                    # 상태 정보 셀(8번째 열) 확인 (원본 로직)
+                    status_span_xpath = '//*[@id="root"]/div/main/div[2]/div[2]/div[2]/table/tbody/tr/td[8]/span'
+                    try:
+                        # *** TimeoutException 처리 수정 적용 ***
+                        # 대기 시간을 10초로 늘림
+                        status_elem = WebDriverWait(driver, 10).until(
+                            EC.presence_of_element_located((By.XPATH, status_span_xpath))
+                        )
+                        logging.info(f"행 {i}: 상태 정보 셀(span) 있음")
+                        numberStatusValue = status_elem.text.strip()
+                        logging.info(f"행 {i}: 안심번호 상태 값: '{numberStatusValue}'")
+
+                        # 상태 값 비교 (원본 로직)
+                        loggin('info', f"Google Sheet [{i}]번째 신고 건 / @ numberStatusValue -> {numberStatusValue}")
+                        if "착신번호 결번 혹은 유효하지 않은 번호" == numberStatusValue:
+                            result = "CorrectInvalidNumber"
+                        elif "착신시도중 발신측 호 종료" == numberStatusValue:
+                            result = "NormalNumber"
+                        elif "통화성공" == numberStatusValue:
+                            result = "NormalNumber"
+                        elif "착신 무응답" == numberStatusValue:
+                            result = "NormalNumber"
+                        elif "착신 통화중" == numberStatusValue:
+                            result = "NormalNumber"
+                        elif "" == numberStatusValue: # 상태값이 비어있는 경우
+                            logging.info(f"행 {i}: 상태값이 비어있음, 통화시간 Table에 0초라고 적혀있는지 체크 시작")
+                            status_span_callingtime_xpath = '//*[@id="root"]/div/main/div[2]/div[2]/div[2]/table/tbody/tr[1]/td[7]/span'
+                            
+                            try:
+                                callingtime_table_elem = WebDriverWait(driver, 3).until(
+                                    EC.presence_of_element_located((By.XPATH, status_span_callingtime_xpath))
+                                )
+                                logging.info(f"행 {i}: 상태 정보 셀(span) 있음")
+                                callingTimeValue = callingtime_table_elem.text.strip()
+                                if "0" in callingTimeValue or "초" in callingTimeValue:
+                                    logging.info(f"행 {i}: Calling Time이 0초 또는 {callingTimeValue}, 정상처리")
+                                    result = "NormalNumber"
+                                else:
+                                    raise Exception("안심번호 상태값 비어있음") # 오류로 간주
+                            except:
+                                logging.error(f"행 {i}: Calling Time 확인 실패 - {str(e)}", exc_info=True)
+                                loggin('warning', f"Google Sheet [{i}]번째 신고 건 / Calling Time 확인 실패: {e}")
+                                ErrorNotice(e, i)
+                                continue # 다음 행으로
+
+                        else: # 예상 못한 상태값
+                             logging.warning(f"행 {i}: 예상 못한 안심번호 상태값 '{numberStatusValue}'")
+                             raise Exception(f"행 {i}: 예상 못한 안심번호 상태값 ") # 오류로 간주
+
+                        ContinueNotice(result, i)
+
+                    # *** TimeoutException 처리 수정 적용 ***
+                    except (NoSuchElementException, TimeoutException):
+                        # 상태 span 요소를 찾지 못하거나 타임아웃 발생 시
+                        logging.info(f"행 {i}: 상태 정보 요소(span) 없음 또는 타임아웃 발생")
+                        # Fallback: 첫 번째 셀 텍스트 확인 ("데이터가 없습니다.")
+                        time.sleep(1) # 원본 유지
+                        try:
+                            td_text = driver.execute_script("return arguments[0].innerText;", row_elem).strip()
+                        except Exception as js_err:
+                            logging.warning(f"행 {i}: 첫 번째 셀 텍스트 추출 실패 (JavaScript 오류): {js_err}")
+                            td_text = ""
+
+                        logging.info(f"행 {i}: 첫 번째 셀 텍스트 내용: '{td_text}'")
+                        loggin('info', f"Google Sheet [{i}]번째 신고 건 / @ td_text -> {td_text}")
+
+                        if td_text == "데이터가 없습니다.":
+                            logging.info(f"행 {i}: 데이터 없음, 정상 전화번호로 처리")
+                            result = "NormalNumber"
+                            ContinueNotice(result, i)
+                        else:
+                             # 상태 span 없고, '데이터 없음'도 아닌 경우 -> 정상 간주 (원본 로직)
+                             logging.warning(f"행 {i}: 상태 정보 불명확 (span 없음/타임아웃, 데이터 없음 아님), 정상으로 간주")
+                             result = "NormalNumber"
+                             ContinueNotice(result, i)
+
+                # 안심번호 상태 확인 중 WebDriver 관련 오류 처리 (critical_exception 호출)
+                except (NoSuchWindowException, WebDriverException) as e:
+                     logging.error(f"행 {i}: WebDriver 오류 발생 (Step 2 - 안심번호 상태 확인)")
+                     critical_exception(e, "안심번호 상태 확인", i)
+                # 안심번호 상태 확인 중 그 외 예외 처리 (ErrorNotice 호출 후 다음 행으로)
+                except Exception as e:
+                    logging.error(f"행 {i}: 안심번호 상태 값 확인 실패 - {str(e)}", exc_info=True)
+                    loggin('warning', f"Google Sheet [{i}]번째 신고 건 / ⚠️numberStatusValue 확인 실패: {e}")
+                    ErrorNotice(e, i)
+                    continue # 다음 행으로
+
+            # *** RPA_NUMBER 원본 로직 종료 ***
+
+        # 메인 루프의 최상위 예외 처리 (critical_exception 호출)
+        except (NoSuchWindowException, WebDriverException) as e:
+            logging.error(f"행 {i}: 메인 루프 WebDriver 오류 발생")
+            critical_exception(e, "Main Loop Processing", i)
+        except Exception as e:
+            logging.error(f"행 {i}: 메인 처리 루프에서 알 수 없는 예외 발생 - {str(e)}", exc_info=True)
+            loggin('warning', f"Google Sheet [{i}]번째 신고 건 / ⚠️ Main for문에서, 알 수 없는 예외가 발생했습니다.")
+            ErrorNotice(f"Main loop unknown error: {e}", i)
+            continue # 다음 행 처리
+
+        # --- 루프 종료 전 시트 업데이트 ---
+        SheetUpdatePost(i) # 각 행 처리 완료 후 저장된 내용 업데이트
+        logging.info(f"===== 행 {i} 처리 완료 =====")
+        # --- 루프 간 대기 시간 (필요 시) ---
+        # time.sleep(1) # 서버 부하 감소 목적 등
+
+    logging.info("main_task 종료: 모든 행 처리 완료")
+
+
+# --- 메인 실행 함수 (PRO와 동일 구조) ---
+def main():
+    global driver # 전역 driver 객체 사용 명시
+    try:
+        logging.info("프로세스 시작")
+        Reset() # 시트 확인 및 시작/종료 셀 설정
+
+        logging.info("웹드라이버 초기화 시작 (soomgo_login_util 사용)")
+        driver = get_soomgo_driver() # 로그인 및 드라이버 객체 얻기
+
+        if not driver:
+            logging.error("WebDriver 초기화 실패, 스크립트를 종료합니다.")
+            try:
+                SavedUpdateSheetValues(absCell_Status, "⚠️ RPA Error")
+                SavedUpdateSheetValues(absCell_ETA, "Driver Init Failed")
+                SheetUpdatePost(0)
+            except Exception as sheet_err:
+                 logging.error(f"드라이버 초기화 실패 상태 시트 업데이트 중 오류: {sheet_err}")
+            sys.exit(1)
+
+        logging.info("웹드라이버 초기화 완료")
+
+        main_task() # 핵심 작업 수행
+
+        logging.info("모든 작업 처리 완료")
+        SavedUpdateSheetValues(absCell_Status, "✅ RPA Complete")
+        SavedUpdateSheetValues(absCell_ETA, "-")
+        SavedUpdateSheetValues(absCell_Progress_Percent, "100.0%")
+        SheetUpdatePost(global_endCell)
+
+    except UnexpectedAlertPresentException as alert_e:
+        logging.warning(f"메인 프로세스 중 예상치 못한 Alert 발생: {alert_e}")
+        try:
+            alert = driver.switch_to.alert
+            alert_text = alert.text
+            logging.warning(f"Alert 내용: {alert_text}. Alert를 닫습니다.")
+            alert.accept()
+            raise Exception(f"Uncaught Alert: {alert_text}")
+        except NoAlertPresentException:
+            logging.error("UnexpectedAlertPresentException 발생했으나 Alert를 찾을 수 없음.", exc_info=True)
+        except Exception as e_alert:
+            logging.error(f"Alert 처리 중 오류 발생: {e_alert}", exc_info=True)
+            raise e_alert
+
+    except Exception as e:
+        logging.error(f"메인 함수에서 예외 발생: {str(e)}", exc_info=True)
+        try:
+            SavedUpdateSheetValues(absCell_Status, "⚠️ RPA Error")
+            SavedUpdateSheetValues(absCell_ETA, "Runtime Error")
+            SheetUpdatePost(0)
+        except Exception as sheet_err:
+            logging.error(f"메인 오류 상태 시트 업데이트 중 추가 오류 발생: {sheet_err}")
+
+    finally:
+        if driver:
+            try:
+                logging.info("드라이버 종료 중...")
+                driver.quit()
+                logging.info("드라이버 정상 종료")
+            except Exception as quit_err:
+                logging.warning(f"드라이버 종료 중 오류 발생: {quit_err}")
+        logging.info("RPA 스크립트 최종 종료.")
+
+
+# --- 스크립트 실행 진입점 (PRO와 동일 구조) ---
+if __name__ == "__main__":
+    try:
+        logging.info("프로그램 시작점 진입")
+        main()
+        logging.info("프로그램 정상 종료 (main 함수 완료)")
+    except KeyboardInterrupt:
+        logging.warning("프로그램이 사용자에 의해 중단되었습니다 (Ctrl+C).")
+        loggin('warning', "프로그램이 사용자에 의해 중단되었습니다.")
+        try:
+            SavedUpdateSheetValues(absCell_Status, "⚠️ RPA Interrupted")
+            SavedUpdateSheetValues(absCell_ETA, "-")
+            SheetUpdatePost(0)
+            if driver:
+                driver.quit()
+        except Exception as final_err:
+            logging.error(f"강제 종료 시 후처리 중 오류: {final_err}")
+        sys.exit(0)
+    except Exception as e:
+        logging.critical(f"예상치 못한 최상위 오류로 프로그램 비정상 종료: {str(e)}", exc_info=True)
+        try:
+            SavedUpdateSheetValues(absCell_Status, "⚠️ RPA CRITICAL ERROR")
+            SavedUpdateSheetValues(absCell_ETA, "-")
+            SheetUpdatePost(0)
+            if driver:
+                driver.quit()
+        except Exception as final_err:
+            logging.error(f"최상위 오류 발생 시 후처리 중 오류: {final_err}")
+        sys.exit(1)
+

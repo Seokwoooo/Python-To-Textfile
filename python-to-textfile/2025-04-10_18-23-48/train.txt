@@ -1,0 +1,589 @@
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from transformers import AutoTokenizer
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, precision_score, recall_score, f1_score
+from sklearn.metrics import roc_auc_score, average_precision_score, matthews_corrcoef
+import matplotlib.pyplot as plt
+import os
+from tqdm import tqdm
+import argparse
+import datetime
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+from matplotlib.ticker import MaxNLocator
+from torch.utils.data import DataLoader
+from contextlib import nullcontext
+
+from data_preprocessing import load_data, prepare_data
+from model import SoomgoServiceClassifier, get_device, save_model
+
+def train_epoch(model, train_loader, optimizer, criterion, device, class_weights=None, scaler=None):
+    """
+    한 에폭 동안의 학습을 수행하는 함수 (GPU 최적화 버전)
+    
+    Args:
+        model: 학습할 모델
+        train_loader: 학습 데이터 로더
+        optimizer: 옵티마이저
+        criterion: 손실 함수
+        device: 사용할 디바이스
+        class_weights: 클래스 가중치
+        scaler: 혼합 정밀도 학습을 위한 스케일러
+        
+    Returns:
+        float: 평균 학습 손실
+    """
+    model.train()
+    total_loss = 0
+    
+    for batch in tqdm(train_loader, desc="Training"):
+        # 배치 데이터를 디바이스로 이동 (non_blocking=True로 비동기 전송)
+        request_input_ids = batch['request_input_ids'].to(device, non_blocking=True)
+        request_attention_mask = batch['request_attention_mask'].to(device, non_blocking=True)
+        chat_input_ids = batch['chat_input_ids'].to(device, non_blocking=True)
+        chat_attention_mask = batch['chat_attention_mask'].to(device, non_blocking=True)
+        labels = batch['label'].to(device, non_blocking=True)
+        service_types = batch['service_type'].to(device, non_blocking=True)
+        
+        # 그래디언트 초기화
+        optimizer.zero_grad(set_to_none=True)  # 메모리 효율을 위해 set_to_none=True 사용
+        
+        if scaler is not None:  # GPU에서 혼합 정밀도 학습
+            with torch.cuda.amp.autocast():
+                # 순전파
+                logits, probabilities, service_type_logits = model(
+                    request_input_ids, request_attention_mask,
+                    chat_input_ids, chat_attention_mask
+                )
+                
+                # 가중치 적용된 손실 함수 계산
+                if class_weights is not None:
+                    weighted_criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+                    main_loss = weighted_criterion(logits, labels)
+                else:
+                    main_loss = criterion(logits, labels)
+                
+                # 서비스 유형 분류 손실 (보조 태스크)
+                service_type_loss = criterion(service_type_logits, service_types)
+                
+                # 최종 손실 (메인 태스크와 보조 태스크의 가중 합)
+                loss = main_loss + 0.3 * service_type_loss
+            
+            # 역전파 (스케일러 사용)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:  # CPU 또는 기본 정밀도 학습
+            # 순전파
+            logits, probabilities, service_type_logits = model(
+                request_input_ids, request_attention_mask,
+                chat_input_ids, chat_attention_mask
+            )
+            
+            # 가중치 적용된 손실 함수 계산
+            if class_weights is not None:
+                weighted_criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+                main_loss = weighted_criterion(logits, labels)
+            else:
+                main_loss = criterion(logits, labels)
+            
+            # 서비스 유형 분류 손실 (보조 태스크)
+            service_type_loss = criterion(service_type_logits, service_types)
+            
+            # 최종 손실 (메인 태스크와 보조 태스크의 가중 합)
+            loss = main_loss + 0.3 * service_type_loss
+            
+            # 역전파
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+        
+        total_loss += loss.item()
+    
+    # 에폭 평균 손실 반환
+    return total_loss / len(train_loader)
+
+def evaluate(model, data_loader, criterion, device, class_weights=None):
+    """
+    모델 평가 함수 (GPU 최적화 버전)
+    
+    Args:
+        model: 평가할 모델
+        data_loader: 평가 데이터 로더
+        criterion: 손실 함수
+        device: 사용할 디바이스
+        class_weights: 클래스 가중치
+        
+    Returns:
+        dict: 평가 메트릭 (loss, accuracy, precision, recall, f1, auc, ap, mcc, service_type_accuracy)
+    """
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    all_probs = []  # 확률값 저장 (AUC 계산용)
+    all_service_types = []
+    all_service_type_preds = []
+    
+    with torch.no_grad():
+        with torch.cuda.amp.autocast() if device.type == 'cuda' else nullcontext():
+            for batch in tqdm(data_loader, desc="Evaluating"):
+                # 배치 데이터를 디바이스로 이동 (비동기 전송)
+                request_input_ids = batch['request_input_ids'].to(device, non_blocking=True)
+                request_attention_mask = batch['request_attention_mask'].to(device, non_blocking=True)
+                chat_input_ids = batch['chat_input_ids'].to(device, non_blocking=True)
+                chat_attention_mask = batch['chat_attention_mask'].to(device, non_blocking=True)
+                labels = batch['label'].to(device, non_blocking=True)
+                service_types = batch['service_type'].to(device, non_blocking=True)
+                
+                # 순전파
+                logits, probabilities, service_type_logits = model(
+                    request_input_ids, request_attention_mask,
+                    chat_input_ids, chat_attention_mask
+                )
+                
+                # 가중치 적용된 손실 함수 계산
+                if class_weights is not None:
+                    weighted_criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+                    main_loss = weighted_criterion(logits, labels)
+                else:
+                    main_loss = criterion(logits, labels)
+                    
+                service_type_loss = criterion(service_type_logits, service_types)
+                loss = main_loss + 0.3 * service_type_loss
+                
+                # 예측 및 라벨 저장 (CPU로 이동)
+                preds = torch.argmax(probabilities, dim=1).cpu().numpy()
+                probs = probabilities[:, 1].cpu().numpy()  # 부정 클래스의 확률
+                service_type_preds = torch.argmax(service_type_logits, dim=1).cpu().numpy()
+                
+                all_preds.extend(preds)
+                all_probs.extend(probs)
+                all_labels.extend(labels.cpu().numpy())
+                all_service_types.extend(service_types.cpu().numpy())
+                all_service_type_preds.extend(service_type_preds)
+                
+                total_loss += loss.item()
+    
+    # 기본 성능 메트릭 계산
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average='binary', zero_division=0
+    )
+    
+    # 추가 성능 메트릭 계산
+    try:
+        auc = roc_auc_score(all_labels, all_probs)
+    except:
+        auc = 0.0  # 단일 클래스인 경우
+        
+    try:
+        ap = average_precision_score(all_labels, all_probs)
+    except:
+        ap = 0.0  # 단일 클래스인 경우
+        
+    try:
+        mcc = matthews_corrcoef(all_labels, all_preds)
+    except:
+        mcc = 0.0  # 오류 발생 시 기본값
+    
+    service_type_accuracy = accuracy_score(all_service_types, all_service_type_preds)
+    
+    return {
+        'loss': total_loss / len(data_loader),
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'auc': auc,
+        'ap': ap,
+        'mcc': mcc,
+        'service_type_accuracy': service_type_accuracy
+    }
+
+def plot_training_history(history, output_dir, model_name):
+    """
+    학습 히스토리를 시각화하는 함수
+    
+    Args:
+        history (dict): 학습 히스토리
+        output_dir (str): 그래프를 저장할 디렉토리
+        model_name (str): 모델 이름
+    """
+    # 학습 과정 시각화 (손실 및 지표)
+    plt.figure(figsize=(20, 15))
+    
+    # 손실 그래프
+    plt.subplot(3, 2, 1)
+    plt.plot(history['train_loss'], label='Train Loss', marker='o')
+    plt.plot(history['val_loss'], label='Validation Loss', marker='s')
+    plt.title('Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Accuracy 그래프
+    plt.subplot(3, 2, 2)
+    plt.plot(history['val_accuracy'], label='Accuracy', marker='o', color='green')
+    plt.title('Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Precision, Recall 그래프
+    plt.subplot(3, 2, 3)
+    plt.plot(history['val_precision'], label='Precision', marker='o', color='blue')
+    plt.plot(history['val_recall'], label='Recall', marker='s', color='orange')
+    plt.title('Precision & Recall')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # F1 Score 그래프
+    plt.subplot(3, 2, 4)
+    plt.plot(history['val_f1'], label='F1 Score', marker='o', color='red')
+    plt.title('F1 Score')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # AUC, AP 그래프
+    plt.subplot(3, 2, 5)
+    plt.plot(history['val_auc'], label='AUC', marker='o', color='purple')
+    plt.plot(history['val_ap'], label='AP', marker='s', color='brown')
+    plt.title('AUC & AP')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # MCC 그래프
+    plt.subplot(3, 2, 6)
+    plt.plot(history['val_mcc'], label='MCC', marker='o', color='teal')
+    plt.title('Matthews Correlation Coefficient')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'{model_name}_training_history.png'))
+    plt.close()
+
+def plot_confusion_matrix(labels, predictions, output_dir, model_name):
+    """
+    혼동 행렬을 시각화하는 함수
+    
+    Args:
+        labels (array): 실제 레이블
+        predictions (array): 예측 레이블
+        output_dir (str): 그래프를 저장할 디렉토리
+        model_name (str): 모델 이름
+    """
+    cm = confusion_matrix(labels, predictions)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['적합', '부적합'], 
+                yticklabels=['적합', '부적합'])
+    plt.title('Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'{model_name}_confusion_matrix.png'))
+    plt.close()
+
+def plot_performance_metrics(metrics, output_dir, model_name):
+    """
+    모델의 성능 지표를 시각화하는 함수
+    
+    Args:
+        metrics (dict): 모델 성능 지표
+        output_dir (str): 그래프를 저장할 디렉토리
+        model_name (str): 모델 이름
+    """
+    metric_names = ['Accuracy', 'Precision', 'Recall', 'F1', 'AUC', 'AP', 'MCC', 'Service Type']
+    metric_values = [
+        metrics['accuracy'],
+        metrics['precision'],
+        metrics['recall'],
+        metrics['f1'],
+        metrics['auc'],
+        metrics['ap'],
+        metrics['mcc'],
+        metrics['service_type_accuracy']
+    ]
+    
+    plt.figure(figsize=(12, 8))
+    colors = ['#3498db', '#2ecc71', '#f39c12', '#e74c3c', '#9b59b6', '#1abc9c', '#34495e', '#95a5a6']
+    bars = plt.bar(metric_names, metric_values, color=colors)
+    
+    # 바 위에 값 표시
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                 f'{height:.4f}', ha='center', va='bottom', fontweight='bold')
+    
+    plt.title(f'Performance Metrics: {model_name}')
+    plt.ylim(0, 1.1)  # 값이 0~1 범위이므로
+    plt.ylabel('Score')
+    plt.grid(True, linestyle='--', alpha=0.7, axis='y')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'{model_name}_performance_metrics.png'))
+    plt.close()
+
+def main(device='cpu', batch_size=32, num_epochs=5, learning_rate=2e-5, 
+         num_workers=None, mixed_precision=False, monitor_gpu=False):
+    """
+    메인 함수
+    
+    Args:
+        device (str): 학습에 사용할 디바이스 (cpu 또는 gpu)
+        batch_size (int): 배치 크기
+        num_epochs (int): 학습 에폭 수
+        learning_rate (float): 학습률
+        num_workers (int): 데이터 로딩 워커 수
+        mixed_precision (bool): 혼합 정밀도 학습 사용 여부
+        monitor_gpu (bool): GPU 모니터링 사용 여부
+    """
+    # 타임스탬프와 디바이스 정보를 포함한 모델 이름 생성
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_name = f"soomgo_classifier_{timestamp}_{device}"
+    
+    # 데이터 경로 설정
+    data_path = "DataSet/soomgo_data.json"
+    
+    print(f"\n{device.upper()}를 사용하여 학습합니다.")
+    # 입력 디바이스 문자열에 따라 디바이스 객체 생성
+    device = torch.device('cuda' if torch.cuda.is_available() and device == 'gpu' else 'cpu')
+    print(f"사용 디바이스: {device}")
+    print(f"배치 크기: {batch_size}")
+    print(f"에폭 수: {num_epochs}")
+    print(f"학습률: {learning_rate}")
+    print(f"혼합 정밀도 학습: {'사용' if mixed_precision and device.type == 'cuda' else '사용 안 함'}")
+    
+    # 출력 디렉토리 설정 - 통합된 폴더로 경로 변경
+    output_dir = 'unified_output'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # 데이터 로드
+    print(f"\n데이터 로드 중: {data_path}")
+    df = load_data(data_path)
+    
+    # 데이터 분포 출력
+    print(f"총 데이터 수: {len(df)}")
+    print(f"적합한 요청 수: {len(df[df['label'] == 0])}")
+    print(f"부적합한 요청 수: {len(df[df['label'] == 1])}")
+    
+    # 토크나이저 초기화
+    tokenizer = AutoTokenizer.from_pretrained('klue/bert-base')
+    
+    # CPU 코어 수 확인 및 워커 수 설정
+    if num_workers is None:
+        cpu_count = os.cpu_count() or 4
+        num_workers = min(8, cpu_count - 1)  # 최소 1개의 코어는 메인 프로세스용으로 남김
+    
+    print(f"데이터 로딩 워커 수: {num_workers}")
+    
+    # 데이터 준비 - GPU 최적화된 데이터 로더 생성
+    train_loader, val_loader, test_loader, class_weights = prepare_data(
+        df, tokenizer, test_size=0.2, val_size=0.1, random_state=42, 
+        augment=True, batch_size=batch_size, num_workers=num_workers, 
+        pin_memory=True if device.type == 'cuda' else False
+    )
+    
+    # 모델 초기화
+    model = SoomgoServiceClassifier(num_heads=8)  # 멀티헤드 어텐션 헤드 수 설정
+    
+    # 모델을 GPU에 올리기 전에 메모리 사용량 예측
+    if device.type == 'cuda':
+        param_size = 0
+        for param in model.parameters():
+            param_size += param.nelement() * param.element_size()
+        buffer_size = 0
+        for buffer in model.buffers():
+            buffer_size += buffer.nelement() * buffer.element_size()
+        
+        model_size_mb = (param_size + buffer_size) / 1024**2
+        print(f"\n===== 모델 정보 =====")
+        print(f"모델 크기: {model_size_mb:.2f} MB")
+        print(f"모델 파라미터 수: {sum(p.numel() for p in model.parameters()):,}")
+        
+        # GPU 메모리가 충분한지 확인
+        estimated_usage = model_size_mb * 4  # 모델, 그래디언트, 옵티마이저 상태 포함 대략적 추정
+        if estimated_usage > torch.cuda.get_device_properties(device).total_memory * 0.7:  # GPU 메모리의 70%를 넘으면 경고
+            print(f"경고: 예상 메모리 사용량({estimated_usage:.2f}MB)이 GPU 메모리({torch.cuda.get_device_properties(device).total_memory / 1024**2:.2f}MB)의 70%를 초과합니다.")
+            print(f"배치 크기를 줄이거나 더 작은 모델을 사용하는 것을 고려하세요.")
+        
+        # GPU에 모델 로드
+        model = model.to(device)
+        print(f"모델이 GPU로 이동되었습니다.")
+        
+        # CUDA 메모리 상태 출력
+        allocated = torch.cuda.memory_allocated(device) / 1024**2
+        cached = torch.cuda.memory_cached(device) / 1024**2
+        print(f"할당된 GPU 메모리: {allocated:.2f} MB")
+        print(f"캐시된 GPU 메모리: {cached:.2f} MB")
+        print(f"사용 가능한 GPU 메모리: {torch.cuda.get_device_properties(device).total_memory / 1024**2 - allocated:.2f} MB")
+    else:
+        model = model.to(device)
+    
+    # 옵티마이저 및 손실 함수 설정 (Mixed Precision 추가)
+    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+    criterion = nn.CrossEntropyLoss()
+    
+    # 혼합 정밀도 학습 설정 (FP16 사용)
+    scaler = torch.cuda.amp.GradScaler() if mixed_precision and device.type == 'cuda' else None
+    
+    # 학습 히스토리 초기화
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'val_accuracy': [],
+        'val_precision': [],
+        'val_recall': [],
+        'val_f1': [],
+        'val_auc': [],  # AUC 추가
+        'val_ap': [],   # 평균 정밀도 추가
+        'val_mcc': [],  # Matthews 상관계수 추가
+        'val_service_type_accuracy': []
+    }
+    
+    # 학습 시작
+    print("\n===== 학습 시작 =====")
+    for epoch in range(num_epochs):
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        
+        # 학습 (GPU 최적화된 train_epoch 함수 사용)
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, class_weights, scaler)
+        history['train_loss'].append(train_loss)
+        
+        # 검증
+        val_metrics = evaluate(model, val_loader, criterion, device, class_weights)
+        history['val_loss'].append(val_metrics['loss'])
+        history['val_accuracy'].append(val_metrics['accuracy'])
+        history['val_precision'].append(val_metrics['precision'])
+        history['val_recall'].append(val_metrics['recall'])
+        history['val_f1'].append(val_metrics['f1'])
+        history['val_auc'].append(val_metrics['auc'])  # AUC 추가
+        history['val_ap'].append(val_metrics['ap'])    # AP 추가
+        history['val_mcc'].append(val_metrics['mcc'])  # MCC 추가
+        history['val_service_type_accuracy'].append(val_metrics['service_type_accuracy'])
+        
+        # 결과 출력
+        print(f"Train Loss: {train_loss:.4f}")
+        print(f"Val Loss: {val_metrics['loss']:.4f}")
+        print(f"Val Accuracy: {val_metrics['accuracy']:.4f}")
+        print(f"Val Precision: {val_metrics['precision']:.4f}")
+        print(f"Val Recall: {val_metrics['recall']:.4f}")
+        print(f"Val F1: {val_metrics['f1']:.4f}")
+        print(f"Val AUC: {val_metrics['auc']:.4f}")  # AUC 출력
+        print(f"Val AP: {val_metrics['ap']:.4f}")    # AP 출력
+        print(f"Val MCC: {val_metrics['mcc']:.4f}")  # MCC 출력
+        print(f"Val Service Type Accuracy: {val_metrics['service_type_accuracy']:.4f}")
+        
+        # GPU 메모리 상태 출력 (선택 사항)
+        if device.type == 'cuda':
+            allocated = torch.cuda.memory_allocated(device) / 1024**2
+            cached = torch.cuda.memory_cached(device) / 1024**2
+            print(f"현재 GPU 메모리 사용량: {allocated:.2f} MB / 캐시: {cached:.2f} MB")
+            torch.cuda.empty_cache()  # 에폭마다 캐시 비우기
+
+    # 테스트 세트 평가
+    print("\n===== 테스트 세트 평가 =====")
+    test_metrics = evaluate(model, test_loader, criterion, device, class_weights)
+    print(f"Test Loss: {test_metrics['loss']:.4f}")
+    print(f"Test Accuracy: {test_metrics['accuracy']:.4f}")
+    print(f"Test Precision: {test_metrics['precision']:.4f}")
+    print(f"Test Recall: {test_metrics['recall']:.4f}")
+    print(f"Test F1: {test_metrics['f1']:.4f}")
+    print(f"Test AUC: {test_metrics['auc']:.4f}")  # AUC 출력
+    print(f"Test AP: {test_metrics['ap']:.4f}")    # AP 출력
+    print(f"Test MCC: {test_metrics['mcc']:.4f}")  # MCC 출력
+    print(f"Test Service Type Accuracy: {test_metrics['service_type_accuracy']:.4f}")
+    
+    # 모델 이름에 F1 점수 포함
+    f1_score = test_metrics['f1']
+    model_name = f"model_f1_{f1_score:.4f}_{timestamp}"
+    
+    # 모델 및 토크나이저 저장
+    print("\n===== 모델 저장 =====")
+    model_path = os.path.join(output_dir, "model.pt")  # 통합 경로로 저장
+    f1_model_path = os.path.join(output_dir, f"{model_name}.pt")  # 성능 기록용 추가 저장
+    
+    # 모델 저장
+    torch.save(model.state_dict(), model_path)
+    torch.save(model.state_dict(), f1_model_path)
+    print(f"모델이 저장되었습니다: {model_path}")
+    print(f"성능 버전 모델이 저장되었습니다: {f1_model_path}")
+    
+    # 토크나이저 저장
+    tokenizer_path = os.path.join(output_dir, 'tokenizer')
+    if not os.path.exists(tokenizer_path):
+        tokenizer.save_pretrained(tokenizer_path)
+        print(f"토크나이저가 저장되었습니다: {tokenizer_path}")
+    
+    # 학습 과정 시각화
+    print("\n===== 결과 시각화 =====")
+    plot_training_history(history, output_dir, model_name)
+    
+    # 혼동 행렬 시각화 (테스트 세트 기준)
+    with torch.cuda.amp.autocast() if device.type == 'cuda' and mixed_precision else nullcontext():
+        with torch.no_grad():
+            all_preds = []
+            all_labels = []
+            for batch in tqdm(test_loader, desc="테스트 예측 수집"):
+                request_input_ids = batch['request_input_ids'].to(device, non_blocking=True)
+                request_attention_mask = batch['request_attention_mask'].to(device, non_blocking=True)
+                chat_input_ids = batch['chat_input_ids'].to(device, non_blocking=True)
+                chat_attention_mask = batch['chat_attention_mask'].to(device, non_blocking=True)
+                labels = batch['label']
+                
+                logits, probabilities, _ = model(
+                    request_input_ids, request_attention_mask,
+                    chat_input_ids, chat_attention_mask
+                )
+                preds = torch.argmax(probabilities, dim=1).cpu().numpy()
+                
+                all_preds.extend(preds)
+                all_labels.extend(labels.numpy())
+    
+    plot_confusion_matrix(all_labels, all_preds, output_dir, model_name)
+    
+    # 성능 지표 시각화
+    plot_performance_metrics(test_metrics, output_dir, model_name)
+    
+    print("\n===== 학습 완료! =====")
+    print(f"모델 및 시각화 파일이 {output_dir} 디렉토리에 저장되었습니다.")
+
+if __name__ == "__main__":
+    # 명령줄 인자 파서 설정
+    parser = argparse.ArgumentParser(description="Soomgo 서비스 분류기 학습")
+    parser.add_argument('--device', choices=['cpu', 'gpu'], default='cpu', help="학습에 사용할 디바이스 (cpu 또는 gpu)")
+    parser.add_argument('--batch_size', type=int, default=32, help="배치 크기 (기본값: 32, GPU 메모리에 맞게 조정)")
+    parser.add_argument('--epochs', type=int, default=5, help="학습 에폭 수 (기본값: 5)")
+    parser.add_argument('--lr', type=float, default=2e-5, help="학습률 (기본값: 2e-5)")
+    parser.add_argument('--workers', type=int, default=None, help="데이터 로딩 워커 수 (기본값: CPU 코어 수 - 1)")
+    parser.add_argument('--mixed_precision', action='store_true', help="혼합 정밀도 학습 사용 (FP16)")
+    parser.add_argument('--monitor_gpu', action='store_true', help="GPU 사용량 모니터링 활성화")
+    
+    args = parser.parse_args()
+    
+    # 메인 함수 호출
+    main(
+        device=args.device,
+        batch_size=args.batch_size,
+        num_epochs=args.epochs,
+        learning_rate=args.lr,
+        num_workers=args.workers,
+        mixed_precision=args.mixed_precision,
+        monitor_gpu=args.monitor_gpu
+    ) 

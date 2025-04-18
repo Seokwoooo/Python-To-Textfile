@@ -1,0 +1,133 @@
+import os
+import sys
+import torch
+from model import ImprovedSoomgoServiceClassifier, CrossModalAttention, extract_qa_pairs, load_model
+from predict import predict_suitability_improved, get_device, format_input_text
+
+def test_improved_model():
+    """
+    개선된 모델 구조 테스트
+    """
+    print("================ 개선된 모델 구조 테스트 ===============")
+    
+    # 디바이스 설정
+    device = get_device()
+    print(f"사용 디바이스: {device}")
+    
+    # 모델 초기화 (가중치 로드 없이)
+    model = ImprovedSoomgoServiceClassifier(
+        model_name='klue/bert-base',
+        service_descriptions_path='DataSet/service_descriptions.json'
+    )
+    model = model.to(device)
+    
+    # 모델 구조 출력
+    print("\n모델 구조:")
+    print(f"- BERT 모델: {model.bert.__class__.__name__}")
+    print(f"- Q-A 어텐션: {model.qa_attention.__class__.__name__}")
+    print(f"- 서비스 어텐션: {model.service_attention.__class__.__name__}")
+    
+    # 테스트 입력
+    request_text = "[Q] 어떤 서비스를 원하시나요? [A] 입주청소 [Q] 어떤 건물인가요? [A] 아파트"
+    chat_text = "고객: 청소해주실 분 찾고 있어요"
+    
+    print("\n테스트 입력:")
+    print(f"- 요청 텍스트: {request_text}")
+    print(f"- 채팅 텍스트: {chat_text}")
+    
+    # 모델 순전파 테스트
+    try:
+        print("\n모델 순전파 테스트...")
+        model.eval()
+        with torch.no_grad():
+            logits, probabilities, service_type_logits = model([request_text], [chat_text])
+        
+        print("순전파 성공!")
+        print(f"- 로짓 shape: {logits.shape}")
+        print(f"- 확률 shape: {probabilities.shape}")
+        print(f"- 서비스 유형 로짓 shape: {service_type_logits.shape}")
+        
+        print("\n예측 결과:")
+        print(f"- 적합/부적합 확률: {probabilities[0].cpu().numpy()}")
+        
+        # 서비스 유형 확률
+        service_probs = torch.softmax(service_type_logits, dim=1)[0].cpu().numpy()
+        service_types = ['입주청소', '이사청소', '거주청소', '기타청소']
+        for i, (service, prob) in enumerate(zip(service_types, service_probs)):
+            print(f"- {service} 확률: {prob:.4f}")
+    
+    except Exception as e:
+        print(f"테스트 실패: {e}")
+        import traceback
+        traceback.print_exc()
+
+def test_qa_extraction():
+    """
+    질문-답변 추출 기능 테스트
+    """
+    print("\n================ 질문-답변 추출 테스트 ===============")
+    
+    test_requests = [
+        # 일반적인 요청
+        "[Q] 어떤 서비스를 원하시나요? [A] 입주청소 [Q] 어떤 건물인가요? [A] 아파트 [Q] 방 개수를 선택해주세요. [A] 3개",
+        # 공백이 있는 요청
+        "[Q] 어떤 서비스를 원하시나요?  [A]  입주청소  [Q]  어떤 건물인가요?  [A]  아파트  ",
+        # 빈 답변이 있는 요청
+        "[Q] 어떤 서비스를 원하시나요? [A] 입주청소 [Q] 추가 요청사항이 있으신가요? [A] ",
+        # '고수와 상담시 논의할게요' 답변이 있는 요청
+        "[Q] 베란다 개수를 선택해주세요. [A] 1개 [Q] 추가 청소 필요한 부분을 선택해주세요. [A] 고수와 상담시 논의할게요"
+    ]
+    
+    for i, req in enumerate(test_requests):
+        print(f"\n테스트 요청 {i+1}:")
+        print(req)
+        
+        pairs = extract_qa_pairs(req)
+        print(f"추출된 질문-답변 쌍 ({len(pairs)}):")
+        for j, (q, a) in enumerate(pairs):
+            print(f"  {j+1}. Q: '{q}' -> A: '{a}'")
+
+def test_model_load():
+    """
+    개선된 모델 로드 테스트
+    """
+    print("\n================ 개선된 모델 로드 테스트 ===============")
+    
+    # 디바이스 설정
+    device = get_device()
+    
+    # 모델 경로 설정
+    model_path = "unified_output/model.pt"
+    tokenizer_path = "unified_output/tokenizer"
+    
+    try:
+        # 개선된 모델 로드
+        model, tokenizer = load_model(model_path, tokenizer_path, device, use_improved=True)
+        print("개선된 모델 로드 성공!")
+        
+        # 기본 예측 테스트
+        request_text = "[Q] 어떤 서비스를 원하시나요? [A] 입주청소"
+        chat_text = "고객: 청소가 필요합니다"
+        
+        score, service_type_info = predict_suitability_improved(
+            request_text, chat_text, model, tokenizer, device
+        )
+        
+        print(f"\n예측 결과:")
+        print(f"- 적합도 점수: {score:.2f}%")
+        print(f"- 예측 서비스 유형: {service_type_info['predicted_type']} (신뢰도: {service_type_info['confidence']:.2f}%)")
+        
+    except Exception as e:
+        print(f"모델 로드 테스트 실패: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    # 질문-답변 추출 테스트
+    test_qa_extraction()
+    
+    # 개선된 모델 구조 테스트
+    test_improved_model()
+    
+    # 개선된 모델 로드 테스트
+    test_model_load() 

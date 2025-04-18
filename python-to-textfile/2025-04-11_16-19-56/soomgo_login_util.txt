@@ -1,0 +1,377 @@
+# soomgo_login_util.py
+
+import os
+import time
+import platform
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    TimeoutException,
+    UnexpectedAlertPresentException,
+    NoAlertPresentException
+)
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import logging
+import traceback # 상세 오류 로깅 위해 추가
+
+# 로깅 설정 (기존과 동일)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def attempt_automatic_login(driver):
+    """
+    Soomgo Force에 Google 계정을 사용하여 자동 로그인을 시도합니다.
+    (사용자가 제공한 SoomgoManualLogin 로직 기반 + 안정성 개선)
+
+    Args:
+        driver: 현재 WebDriver 인스턴스.
+
+    Returns:
+        bool: 로그인이 성공한 것으로 보이면 True, 아니면 False.
+    """
+    try:
+        original_window = driver.current_window_handle
+        logging.info("자동 로그인 시도: 프로덕션 라디오 버튼 확인...")
+        # Production Radio Button (XPath 원본 유지 + WebDriverWait)
+        prod_radio_xpath = '//*[@id="root"]/div/div[2]/div/div/div/div/div[1]/fieldset/div/label[2]/span[1]/input'
+        prod_radio = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, prod_radio_xpath))
+        )
+        if not prod_radio.is_selected():
+            logging.info("프로덕션 라디오 버튼 클릭.")
+            # JavaScript 클릭이 더 안정적일 수 있음
+            driver.execute_script("arguments[0].click();", prod_radio)
+            time.sleep(0.5) # 클릭 후 잠시 대기
+
+        logging.info("자동 로그인 시도: Google Sign 버튼 클릭...")
+        # Google Sign Button (XPath 원본 유지 + WebDriverWait)
+        google_button_xpath = '//*[@id="root"]/div/div[2]/div/div/div/div/div[2]/button'
+        google_button = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, google_button_xpath))
+        )
+        google_button.click()
+        logging.info("Google Sign 버튼 클릭 완료. 팝업 대기...")
+        time.sleep(3) # 팝업 창 열릴 시간 대기 (필요 시 WebDriverWait로 개선 가능)
+
+        # --- Google Popup Handling ---
+        logging.info("Google 로그인 팝업 창으로 전환 시도...")
+        WebDriverWait(driver, 15).until(EC.number_of_windows_to_be(2)) # 팝업 창이 2개가 될 때까지 대기
+        popup_window = None
+        for handle in driver.window_handles:
+            if handle != original_window:
+                popup_window = handle
+                break
+
+        if not popup_window:
+             logging.error("Google 로그인 팝업 창을 찾을 수 없습니다.")
+             return False
+
+        driver.switch_to.window(popup_window)
+        logging.info(f"Google 로그인 팝업으로 전환됨. URL: {driver.current_url}")
+        time.sleep(1.5) # 팝업 내용 로드 대기
+
+        # 계정 선택 (사용자 제공 XPath 기반 + WebDriverWait)
+        # 사용자 제공 XPath: //*[@id="yDmH0d"]/div[1]/div[1]/div[2]/div/div/div[2]/div/div/div[1]/form/span/section/div/div/div/div/ul/li[1]/div/div[1]/div/div[1]/img
+        # 주의: 이 XPath는 매우 불안정할 수 있습니다.
+        account_xpath = '//*[@id="yDmH0d"]/div[1]/div[1]/div[2]/div/div/div[2]/div/div/div[1]/form/span/section/div/div/div/div/ul/li[1]/div/div[1]/div/div[1]/img'
+        # 대안 XPath (더 일반적일 수 있음): //div[@data-identifier] 또는 //div[@data-email]
+        # account_xpath_alt = "//div[@data-identifier] | //div[@data-email]"
+        logging.info("Google 계정 선택 시도 (첫 번째 계정)...")
+        try:
+            # account_element = WebDriverWait(driver, 15).until(
+            #     EC.element_to_be_clickable((By.XPATH, account_xpath_alt)) # 대안 XPath 사용 시
+            # )
+            account_element = WebDriverWait(driver, 15).until(
+                 EC.element_to_be_clickable((By.XPATH, account_xpath)) # 사용자 제공 XPath 사용
+            )
+            logging.info("첫 번째 Google 계정 클릭.")
+            account_element.click()
+            time.sleep(3) # 계정 선택 후 다음 단계 로드 대기
+        except (TimeoutException, NoSuchElementException) as e:
+            logging.warning(f"Google 계정 선택(XPath: {account_xpath}) 실패 또는 시간 초과. 비밀번호 입력 단계일 수 있음: {e}")
+            # 계정 선택이 필요 없거나 이미 선택된 경우일 수 있으므로 계속 진행
+            pass
+
+        # '계속' 버튼 클릭 (사용자 제공 XPath 기반 + WebDriverWait)
+        # 사용자 제공 XPath: //*[@id="yDmH0d"]/c-wiz/div/div[3]/div/div/div[2]/div/div/button
+        # 주의: 이 XPath도 불안정할 수 있습니다.
+        continue_button_xpath = '//*[@id="yDmH0d"]/c-wiz/div/div[3]/div/div/div[2]/div/div/button'
+        # 대안 XPath: //button[contains(., '계속') or contains(., 'Continue') or contains(., 'Next')]
+        logging.info("'계속' 버튼 클릭 시도...")
+        try:
+             continue_button = WebDriverWait(driver, 5).until(
+                 EC.element_to_be_clickable((By.XPATH, continue_button_xpath)) # 사용자 제공 XPath 사용
+                 # EC.element_to_be_clickable((By.XPATH, "//button[contains(., '계속') or contains(., 'Continue') or contains(., 'Next')]")) # 대안 XPath 사용 시
+             )
+             logging.info("'계속' 버튼 클릭.")
+             continue_button.click()
+             time.sleep(3) # 다음 단계 로드 대기
+        except (TimeoutException, NoSuchElementException):
+             logging.info("'계속' 버튼을 찾을 수 없음 (이미 진행되었거나 필요 없을 수 있음).")
+             pass # 필수는 아닐 수 있음
+
+        # '허용' 또는 '승인' 버튼 클릭 (사용자 제공 XPath 기반 + WebDriverWait)
+        # 사용자 제공 XPath: //*[@id="submit_approve_access"]/div/button/span
+        # 주의: 이 XPath도 불안정할 수 있습니다.
+        approve_button_xpath = '//*[@id="submit_approve_access"]/div/button/span'
+        # 대안 XPath: //button[@id='submit_approve_access'] 또는 //button[contains(., '허용') or contains(., 'Allow')]
+        logging.info("'허용/승인' 버튼 클릭 시도...")
+        try:
+             approve_button = WebDriverWait(driver, 10).until(
+                 EC.element_to_be_clickable((By.XPATH, approve_button_xpath)) # 사용자 제공 XPath 사용
+                 # EC.element_to_be_clickable((By.XPATH, "//button[@id='submit_approve_access'] | //button[contains(., '허용') or contains(., 'Allow')]")) # 대안 XPath 사용 시
+             )
+             logging.info("'허용' 또는 '승인' 버튼 클릭.")
+             # JavaScript 클릭이 더 안정적일 수 있음
+             driver.execute_script("arguments[0].click();", approve_button)
+             # approve_button.click() # 일반 클릭
+             time.sleep(3) # 승인 처리 및 창 닫힘 대기
+        except (TimeoutException, NoSuchElementException):
+             logging.info("'허용' 또는 '승인' 버튼을 찾을 수 없음 (이미 승인되었거나 필요 없을 수 있음).")
+             pass # 필수는 아닐 수 있음
+
+        # --- End Google Popup Handling ---
+
+        # 원래 창으로 돌아오기 (팝업이 자동으로 닫혔을 수도 있음)
+        logging.info("원래 창으로 돌아가기 시도...")
+        try:
+            # 현재 활성 창이 팝업 창인지 확인
+            if driver.current_window_handle == popup_window and len(driver.window_handles) > 1:
+                 # 팝업이 아직 열려있으면 메인 창으로 전환
+                 driver.switch_to.window(original_window)
+                 logging.info("원래 창으로 전환됨.")
+                 # 팝업 창을 닫을 수도 있음 (선택 사항)
+                 # driver.close()
+            elif len(driver.window_handles) == 1:
+                 # 창이 하나만 남았다면 이미 메인 창임
+                 driver.switch_to.window(driver.window_handles[0])
+                 logging.info("팝업이 자동으로 닫힌 것으로 보임. 원래 창 활성화됨.")
+            else:
+                 # 여러 창이 있지만 현재 창이 팝업이 아닌 경우 (예상치 못한 상황)
+                 driver.switch_to.window(original_window) # 일단 원래 창으로 시도
+                 logging.info("원래 창으로 전환 시도 (불확실한 상태).")
+
+        except Exception as switch_err:
+             logging.warning(f"원래 창으로 돌아가는 중 오류 (무시 가능): {switch_err}")
+             # 최후의 수단으로 첫 번째 창으로 전환 시도
+             try:
+                 driver.switch_to.window(driver.window_handles[0])
+                 logging.info("첫 번째 창으로 강제 전환.")
+             except Exception as final_switch_err:
+                 logging.error(f"원래 창으로 최종 전환 실패: {final_switch_err}")
+                 return False # 원래 컨텍스트로 돌아갈 수 없음
+
+        # 로그인 성공 최종 확인 (URL 변경 및 대시보드 요소 확인)
+        time.sleep(3) # 페이지 리디렉션 및 로드 대기
+        final_url = driver.current_url
+        logging.info(f"자동 로그인 시도 후 최종 URL: {final_url}")
+        if "login" not in final_url.lower() and "force.soomgo.com" in final_url.lower():
+             try:
+                  # 대시보드 또는 메인 페이지의 특정 요소 확인
+                  WebDriverWait(driver, 10).until(
+                      EC.presence_of_element_located((By.XPATH, '//*[@id="page-wrapper"] | //*[@id="root"]')) # 대표적인 요소 ID
+                  )
+                  logging.info("자동 로그인 성공 최종 확인 (대시보드/루트 요소 감지).")
+                  return True
+             except TimeoutException:
+                  logging.warning("대시보드/루트 요소 감지 실패, 하지만 로그인 페이지는 아님. 성공으로 간주.")
+                  return True # 로그인 페이지가 아니면 일단 성공으로 판단
+        else:
+             logging.error("자동 로그인 실패: 여전히 로그인 페이지에 있거나 URL이 예상과 다름.")
+             return False
+
+    except Exception as e:
+        logging.error(f"자동 로그인 프로세스 중 예외 발생: {e}", exc_info=True)
+        # 오류 발생 시 원래 창으로 돌아가도록 시도
+        try:
+            if driver.current_window_handle != original_window and original_window in driver.window_handles:
+                driver.switch_to.window(original_window)
+        except Exception:
+            pass # 실패 시 무시
+        return False
+
+
+def get_soomgo_driver():
+    """
+    현재 사용자의 Chrome 'Profile 1'을 사용하여 Selenium WebDriver 인스턴스를 설정하고 반환합니다.
+    Soomgo Force 메인 페이지로 이동하며, 세션 오류 Alert 발생 시 자동 로그인을 시도합니다.
+
+    Returns:
+        webdriver.Chrome: 성공적으로 초기화된 WebDriver 인스턴스.
+        None: WebDriver 초기화 또는 자동 로그인 실패 시.
+    """
+    options = Options()
+    driver = None
+
+    try:
+        # --- Chrome Profile 경로 설정 (기존 로직 유지) ---
+        if platform.system() == "Windows":
+            home_dir = os.path.expanduser('~')
+            user_data_dir = os.path.join(home_dir, 'AppData', 'Local', 'Google', 'Chrome', 'User Data', 'Profile 1')
+            logging.info(f"Using Chrome profile path: {user_data_dir}")
+            if os.path.isdir(user_data_dir):
+                options.add_argument(f"--user-data-dir={user_data_dir}")
+            else:
+                logging.warning(f"Chrome profile directory not found at {user_data_dir}.")
+                logging.warning("Proceeding without specific user profile. Automatic login might not work.")
+        else:
+            logging.warning("Profile path detection currently only supports Windows. Proceeding without profile.")
+
+        # --- WebDriver 옵션 설정 (기존 로직 유지) ---
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920x1080")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_experimental_option('excludeSwitches', ['enable-logging'])
+        # options.add_argument("--headless") # 필요 시 주석 해제
+
+        # --- WebDriver 초기화 (webdriver_manager 사용) ---
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            logging.info("Initializing WebDriver Service via webdriver-manager...")
+            service = Service(ChromeDriverManager().install())
+        except Exception as wdm_err:
+             logging.error(f"webdriver-manager failed: {wdm_err}", exc_info=True)
+             return None
+
+        logging.info("Initializing Chrome WebDriver...")
+        driver = webdriver.Chrome(service=service, options=options)
+        logging.info("WebDriver initialized successfully.")
+
+        # --- Soomgo Force 페이지 이동 및 Alert 확인/처리 ---
+        driver.get("https://force.soomgo.com")
+        logging.info("Navigated to force.soomgo.com")
+        time.sleep(2) # 페이지 로드 및 잠재적 Alert 발생 대기
+
+        # *** 수정된 로직: 페이지 로드 직후 세션 오류 Alert 확인 및 자동 로그인 시도 ***
+        alert_handled = False
+        try:
+            alert = driver.switch_to.alert
+            alert_text = alert.text
+            logging.warning(f"페이지 로드 직후 Alert 감지됨: {alert_text}")
+            if "세션 확인에 실패하였습니다" in alert_text:
+                logging.info("### 세션 확인 실패 Alert 감지됨. 자동 로그인 시도... ###")
+                alert.accept() # Alert 닫기
+                alert_handled = True # Alert 처리됨 플래그
+                time.sleep(1) # Alert 닫힌 후 잠시 대기
+
+                # 자동 로그인 함수 호출
+                login_success = attempt_automatic_login(driver)
+
+                if not login_success:
+                     logging.error("### 자동 재로그인 실패. 스크립트 종료. ###")
+                     driver.quit()
+                     return None # 로그인 실패 시 None 반환
+                else:
+                     logging.info("### 자동 재로그인 성공. 페이지 상태 재확인 필요... ###")
+                     # 로그인 성공 후 현재 페이지 URL 확인
+                     time.sleep(2) # 리디렉션 대기
+                     logging.info(f"자동 로그인 후 현재 URL: {driver.current_url}")
+                     # 필요 시 특정 페이지로 다시 이동하거나 상태 재검증 로직 추가 가능
+                     # 예: driver.get("https://force.soomgo.com/main") 등
+            else:
+                # 다른 종류의 예상치 못한 Alert 처리
+                logging.warning(f"예상치 못한 다른 Alert 감지됨: {alert_text}. 일단 닫습니다.")
+                alert.accept()
+                alert_handled = True
+                # 다른 Alert 발생 시에도 실패 처리할지 결정 (여기서는 일단 진행)
+
+        except NoAlertPresentException:
+            # Alert 없음, 정상 진행
+            logging.info("페이지 로드 후 즉시 발생한 Alert 없음. 계속 진행.")
+            pass
+
+        # --- '이어서 진행하기' 버튼 처리 (Alert 처리 후 또는 Alert 없었을 경우) ---
+        # Alert가 처리되지 않았다면 이 단계는 건너뛸 수 있음 (이미 오류 상황)
+        if not alert_handled: # Alert가 없었거나, 세션오류 외 다른 Alert를 닫고 진행하는 경우
+            try:
+                logging.info("'이어서 진행하기' 버튼 확인 시도 (최대 5초 대기)...")
+                wait = WebDriverWait(driver, 5)
+                continue_button = wait.until(EC.element_to_be_clickable((By.XPATH, '//button[text()="이어서 진행하기"]')))
+                # 버튼이 있다면 클릭 (프로필 로그인이 유효한 경우)
+                logging.info("Clicked '이어서 진행하기' button.")
+                continue_button.click()
+                time.sleep(1) # 클릭 후 잠시 대기
+
+            except TimeoutException:
+                # 버튼이 시간 내에 안 나타나는 것은 정상 (로그인 필요 상태 또는 자동로그인 성공 상태)
+                logging.info("'이어서 진행하기' button not found within timeout period.")
+            except UnexpectedAlertPresentException as alert_e:
+                # 버튼 확인 중 또 Alert 발생 시 (자동 로그인 실패 또는 다른 문제)
+                alert_text = "N/A"
+                try:
+                    alert = driver.switch_to.alert
+                    alert_text = alert.text
+                    alert.accept()
+                except NoAlertPresentException:
+                    pass
+                logging.error(f"### '이어서 진행하기' 확인 중 Alert 재발생: {alert_text}. 진행 불가. ###")
+                driver.quit()
+                return None # 실패 반환
+            except Exception as e:
+                logging.warning(f"Could not click '이어서 진행하기' button (Other Error): {e}")
+
+        # --- 최종 상태 확인 (자동 로그인 후 또는 '이어서 진행하기' 처리 후) ---
+        # 최종적으로 Alert가 남아있는지 다시 확인
+        try:
+            alert = driver.switch_to.alert
+            alert_text = alert.text
+            logging.warning(f"최종 확인에서 Alert 감지됨: {alert_text}")
+            if "세션 확인에 실패하였습니다" in alert_text:
+                 logging.error("### 최종 확인에서 세션 확인 실패 Alert 감지됨. 로그인 실패. ###")
+                 alert.accept()
+                 driver.quit()
+                 return None
+            else:
+                 # 다른 Alert는 일단 닫고 진행 시도
+                 alert.accept()
+        except NoAlertPresentException:
+            pass # 최종 Alert 없음
+
+        # 현재 URL이 로그인 페이지인지 다시 확인
+        current_url = driver.current_url
+        logging.info(f"최종 확인 시 현재 URL: {current_url}")
+        if "login" in current_url and "force.soomgo.com" in current_url:
+             try:
+                  driver.find_element(By.ID, 'username') # 로그인 폼 요소 확인
+                  logging.error("### 최종 확인: 여전히 로그인 페이지에 머물러 있음. 로그인 실패. ###")
+                  driver.quit()
+                  return None
+             except NoSuchElementException:
+                  # 로그인 폼이 안 보이면 괜찮음
+                  pass
+
+        # 모든 확인 통과 시 성공
+        logging.info("get_soomgo_driver: 드라이버 준비 및 최종 세션 확인 완료.")
+        return driver
+
+    # --- WebDriver 초기화 또는 네비게이션 중 발생한 예외 처리 ---
+    except Exception as e:
+        logging.error(f"Failed to initialize WebDriver or navigate: {e}", exc_info=True)
+        if driver:
+            driver.quit()
+        return None # 실패 반환
+
+# 이 파일을 직접 실행할 경우 테스트 코드 (기존과 동일)
+if __name__ == '__main__':
+    test_driver = None
+    try:
+        logging.info("--- Testing get_soomgo_driver ---")
+        test_driver = get_soomgo_driver()
+        if test_driver:
+            logging.info(f"Driver acquired successfully. Current URL: {test_driver.current_url}")
+            logging.info("Waiting for 5 seconds...")
+            time.sleep(5)
+        else:
+            logging.error("Failed to acquire driver in test.")
+
+    except Exception as e:
+        logging.error(f"An error occurred during testing: {e}", exc_info=True)
+    finally:
+        if test_driver:
+            logging.info("Closing test driver.")
+            test_driver.quit()
+        logging.info("--- Test finished ---")
